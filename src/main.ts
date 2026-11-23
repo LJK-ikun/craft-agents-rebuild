@@ -1,9 +1,10 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import { OpenAICompatibleProvider } from "./provider.ts";
 import { JsonlSessionStore } from "./sessions/jsonl-store.ts";
+import { WindowManager } from "./main/window-manager.ts";
 
 // ESM 文件没有内置 __dirname；用当前文件地址还原出它所在的目录。
 const currentFile = fileURLToPath(import.meta.url);
@@ -52,27 +53,14 @@ async function createMainWindow(): Promise<void> {
     );
   }
 
-  // 主进程创建桌面窗口，并指定它加载哪个 Preload 和网页。
-  const window = new BrowserWindow({
-    width: 1100,
-    height: 760,
-    webPreferences: {
-      // Preload 在主进程与网页之间提供受控桥梁。
-      preload: path.join(currentDirectory, "preload.cjs"),
-      // 隔离网页和 Preload 的 JavaScript 环境。
-      contextIsolation: true,
-      // 不允许网页直接访问 Node.js 能力。
-      nodeIntegration: false,
-    },
+  // 窗口创建和生命周期交给 WindowManager，主入口只负责启动编排。
+  const windowManager = new WindowManager({
+    preloadPath: path.join(currentDirectory, "preload.cjs"),
+    rendererFilePath: path.join(currentDirectory, "renderer", "index.html"),
+    rendererDevUrl: "http://127.0.0.1:5173",
+    isPackaged: app.isPackaged,
   });
-
-  if (app.isPackaged) {
-    // 打包后加载 Vite 构建出的本地页面。
-    void window.loadFile(path.join(currentDirectory, "renderer", "index.html"));
-  } else {
-    // 开发时加载 Vite 开发服务器；需要另一个终端运行 npm run dev:ui。
-    void window.loadURL("http://127.0.0.1:5173");
-  }
+  windowManager.createWindow({ workspaceId: "default" });
 }
 
 // Electron 初始化完成后才能创建窗口。
