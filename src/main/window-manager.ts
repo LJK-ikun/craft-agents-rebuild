@@ -82,4 +82,38 @@ export class WindowManager {
   getWindows(): BrowserWindow[] {
     return Array.from(this.windows.values()).map(({ window }) => window);
   }
+
+  // 按 workspace 查找窗口。一个窗口对应一个 workspace，
+  // 因此找到第一条仍然存活的匹配记录就可以返回。
+  getWindowByWorkspace(workspaceId: string): BrowserWindow | null {
+    for (const managed of this.windows.values()) {
+      // BrowserWindow 关闭后可能仍短暂留在事件处理过程中，
+      // isDestroyed() 用来避免把已经销毁的窗口交给调用方。
+      if (managed.workspaceId === workspaceId && !managed.window.isDestroyed()) {
+        return managed.window;
+      }
+    }
+    // null 明确表示当前没有可复用的窗口。
+    return null;
+  }
+
+  // 如果该 workspace 已经有窗口，就把它带回屏幕并聚焦；
+  // 否则创建新窗口。这是“避免同一 workspace 重复开窗”的入口。
+  focusOrCreateWindow(workspaceId: string): BrowserWindow {
+    const existing = this.getWindowByWorkspace(workspaceId);
+
+    if (existing) {
+      // 最小化窗口仍存在，只是收进了任务栏；先恢复才能正常显示。
+      if (existing.isMinimized()) {
+        existing.restore();
+      }
+
+      // 把现有窗口放到用户面前，并返回这个窗口对象。
+      existing.focus();
+      return existing;
+    }
+
+    // 没找到可用窗口时，复用已有创建逻辑，保证加载页面和登记映射一致。
+    return this.createWindow({ workspaceId });
+  }
 }
