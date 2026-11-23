@@ -97,6 +97,12 @@ export class WindowManager {
     return null;
   }
 
+  // IPC 事件提供的是 webContents.id；通过它反查该窗口当前属于哪个 workspace。
+  getWorkspaceForWindow(webContentsId: number): string | null {
+    const managed = this.windows.get(webContentsId);
+    return managed?.workspaceId ?? null;
+  }
+
   // 如果该 workspace 已经有窗口，就把它带回屏幕并聚焦；
   // 否则创建新窗口。这是“避免同一 workspace 重复开窗”的入口。
   focusOrCreateWindow(workspaceId: string): BrowserWindow {

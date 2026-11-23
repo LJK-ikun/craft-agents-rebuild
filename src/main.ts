@@ -15,35 +15,76 @@ const currentDirectory = path.dirname(currentFile);
 const apiKey = process.env.OPENAI_API_KEY;
 const modelName = process.env.OPENAI_MODEL;
 const baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
-let agent: Agent | null = null;
-let sessionStore: JsonlSessionStore | null = null;
+
+// 每个工作区各自持有 Agent 和会话文件，避免不同工作区混用聊天上下文。
+type WorkspaceRuntime = {
+  agent: Agent | null;
+  sessionStore: JsonlSessionStore;
+};
+const workspaceRuntimes = new Map<string, WorkspaceRuntime>();
+
 // 保存窗口管理器实例，让应用启动后的 activate 事件也能复用它。
 let windowManager: WindowManager | null = null;
+// 保存工作区清单存储，让 IPC 请求可以校验窗口所属 workspace。
+let workspaceStore: JsonWorkspaceStore | null = null;
 // 记住启动时选中的工作区，窗口重新打开时仍使用同一个 ID。
 let activeWorkspaceId: string | null = null;
 
+// 按 ID 读取或初始化一个工作区运行时：会话文件和 Agent 历史都属于该工作区。
+async function getWorkspaceRuntime(workspaceId: string): Promise<WorkspaceRuntime> {
+  const existing = workspaceRuntimes.get(workspaceId);
+  if (existing) return existing;
+  if (!workspaceStore) throw new Error("工作区存储尚未初始化。");
+
+  // 只允许已登记的 workspace ID 创建运行时，避免任意字符串生成会话目录。
+  const workspace = (await workspaceStore.list()).find((item) => item.id === workspaceId);
+  if (!workspace) throw new Error("找不到这个工作区。");
+
+  const sessionStore = new JsonlSessionStore(
+    path.join(app.getPath("userData"), "sessions", workspace.id, "session.jsonl"),
+    workspace.id,
+  );
+  const previousMessages = await sessionStore.loadMessages();
+
+  // 没有模型配置时仍然可以打开工作区，只是发送问题时会提示补充配置。
+  const agent = apiKey && modelName
+    ? new Agent(
+        new OpenAICompatibleProvider(apiKey, modelName, baseUrl),
+        "你是一个简洁、准确的中文助手。",
+        previousMessages,
+      )
+    : null;
+
+  const runtime = { agent, sessionStore };
+  workspaceRuntimes.set(workspaceId, runtime);
+  return runtime;
+}
+
 // 注册一个固定 IPC 通道：接收界面的问题，调用 Agent，并返回回答。
-ipcMain.handle("agent:ask", async (_event, userText: unknown): Promise<string> => {
+ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> => {
   if (typeof userText !== "string" || !userText.trim()) {
     throw new Error("请输入有效的问题。");
   }
   if (!apiKey || !modelName) {
     throw new Error("请先设置 OPENAI_API_KEY 和 OPENAI_MODEL。");
   }
-  if (!agent || !sessionStore) {
-    throw new Error("会话还没有准备好，请稍后重试。");
-  }
+
+  // IPC 发送方就是当前窗口；用它反查 workspace，确保请求进入正确的会话。
+  const workspaceId = windowManager?.getWorkspaceForWindow(event.sender.id);
+  if (!workspaceId) throw new Error("无法确定当前窗口所属的工作区。");
+  const runtime = await getWorkspaceRuntime(workspaceId);
+  if (!runtime.agent) throw new Error("当前工作区的 Agent 尚未准备好。");
 
   const question = userText.trim();
-  await sessionStore.appendMessage({ role: "user", content: question });
-  const answer = await agent.ask(question);
-  await sessionStore.appendMessage({ role: "assistant", content: answer });
+  await runtime.sessionStore.appendMessage({ role: "user", content: question });
+  const answer = await runtime.agent.ask(question);
+  await runtime.sessionStore.appendMessage({ role: "assistant", content: answer });
   return answer;
 });
 
 async function createMainWindow(): Promise<void> {
   // 先从全局清单读取工作区；首次启动时自动创建默认工作区记录和目录。
-  const workspaceStore = new JsonWorkspaceStore(
+  workspaceStore = new JsonWorkspaceStore(
     path.join(app.getPath("userData"), "workspaces.json"),
   );
   const workspace = await workspaceStore.ensureDefaultWorkspace(
@@ -51,21 +92,8 @@ async function createMainWindow(): Promise<void> {
   );
   activeWorkspaceId = workspace.id;
 
-  // 会话仍按工作区 ID 分目录保存，后面增加多个工作区时可以自然隔离。
-  sessionStore = new JsonlSessionStore(
-    path.join(app.getPath("userData"), "sessions", workspace.id, "session.jsonl"),
-    workspace.id,
-  );
-  const previousMessages = await sessionStore.loadMessages();
-
-  // 用磁盘历史初始化 Agent，使应用重启后模型仍能接续这段对话。
-  if (apiKey && modelName) {
-    agent = new Agent(
-      new OpenAICompatibleProvider(apiKey, modelName, baseUrl),
-      "你是一个简洁、准确的中文助手。",
-      previousMessages,
-    );
-  }
+  // 预先载入默认工作区；应用重启后 Agent 能接着该工作区的聊天记录继续。
+  await getWorkspaceRuntime(workspace.id);
 
   // 窗口创建和生命周期交给 WindowManager，主入口只负责启动编排。
   windowManager = new WindowManager({
