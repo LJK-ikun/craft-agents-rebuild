@@ -20,17 +20,13 @@ For an OpenAI-compatible endpoint, set `OPENAI_BASE_URL` too.
 
 ## Desktop shell
 
-Install project dependencies with `npm install`. Start the renderer in one terminal:
+Install project dependencies with `npm install`. Then start the renderer and desktop shell in two terminals:
 
 ```powershell
 npm run dev:ui
 ```
 
-In a second terminal, set the model credentials and start the desktop shell:
-
 ```powershell
-$env:OPENAI_API_KEY = "..."
-$env:OPENAI_MODEL = "..."
 npm run dev:desktop
 ```
 
