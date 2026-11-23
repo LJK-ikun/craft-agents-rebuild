@@ -8,12 +8,12 @@ A guided educational rebuild inspired by the Craft Agents product. The upstream 
 user message → Agent → model provider → assistant response
 ```
 
-Run with Bun after setting `OPENAI_API_KEY` and `OPENAI_MODEL`:
+Run with Bun after setting `OPENAI_API_KEY` and `OPENAI_MODEL`. Type `/exit` to quit:
 
 ```powershell
 $env:OPENAI_API_KEY = "..."
 $env:OPENAI_MODEL = "..."
-bun run src/index.ts "请用一句话介绍 Agent"
+bun run src/index.ts
 ```
 
 For an OpenAI-compatible endpoint, set `OPENAI_BASE_URL` too.
