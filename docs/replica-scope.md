@@ -9,7 +9,7 @@
 | 模块 | 原版已有的能力 | 原版代码入口/证据 | 学习复刻进度 |
 | --- | --- | --- | --- |
 | 桌面应用 | Electron 主进程、Preload、React Renderer | `apps/electron/src/main`、`preload`、`renderer` | 未开始 |
-| 工作区与会话 | 多工作区、多会话、收件箱/归档、标记、状态流转、会话持久化 | `packages/shared/src/sessions`、`config`、README Session Management | 未开始 |
+| 工作区与会话 | 多工作区、多会话、收件箱/归档、标记、状态流转、会话持久化 | `packages/shared/src/sessions`、`config`、README Session Management | 已有单一默认会话的 JSONL 保存/恢复；多会话和管理界面未开始 |
 | Agent 对话 | 流式响应、工具执行可视化、实时更新 | `packages/shared/src/agent`、`packages/pi-agent-server` | 简化终端版已完成；流式和 UI 未开始 |
 | 模型连接 | Anthropic、Google AI Studio、ChatGPT/Codex、GitHub Copilot、OpenAI 等 | `packages/shared/src/agent`、`auth`、README Multiple LLM Connections | 仅有 OpenAI-compatible 聊天接口 |
 | 工具与来源 | MCP、Craft MCP、REST API、Google/Slack/Microsoft、本地文件系统 | `packages/shared/src/sources`、`packages/pi-agent-server/src/tools` | 未开始 |

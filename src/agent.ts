@@ -5,9 +5,13 @@ export class Agent {
   // 当前会话的消息列表；每次提问都会在这个列表上继续累积。
   private readonly messages: ChatMessage[];
 
-  constructor(private readonly model: ChatModelProvider, systemPrompt: string) {
-    // 系统提示词先放在最前面，规定 Agent 的回答方式。
-    this.messages = [{ role: "system", content: systemPrompt }];
+  constructor(
+    private readonly model: ChatModelProvider,
+    systemPrompt: string,
+    previousMessages: ChatMessage[] = [],
+  ) {
+    // 系统提示词始终放最前面，后面接上从磁盘恢复的历史消息。
+    this.messages = [{ role: "system", content: systemPrompt }, ...previousMessages];
   }
 
   async ask(userText: string): Promise<string> {
