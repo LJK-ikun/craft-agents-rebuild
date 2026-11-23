@@ -1,57 +1,75 @@
 import { BrowserWindow } from "electron";
 
-// WindowManager 只管理桌面窗口；路径和开发/打包状态由 Electron 主入口传入。
+// 主入口交给 WindowManager 的配置。
+// WindowManager 不自己猜路径或环境，而是使用调用者明确传入的值。
 export type WindowManagerConfig = {
+  // Preload 脚本的磁盘路径；BrowserWindow 创建时会加载它。
   preloadPath: string;
+  // 打包后 Vite 生成的本地 HTML 文件路径。
   rendererFilePath: string;
+  // 开发时 Vite 开发服务器的地址。
   rendererDevUrl: string;
+  // true 表示正式打包运行，false 表示本地开发运行。
   isPackaged: boolean;
 };
 
-// 和原版一样，窗口还要关联它所属的 workspace。
+// 创建窗口时需要的业务信息。原版窗口属于一个 workspace，
+// 因此这里也保留 workspaceId，后续可用于多工作区窗口管理。
 export type CreateWindowOptions = {
   workspaceId: string;
 };
 
+// WindowManager 内部保存的窗口记录：除了窗口对象，还记录其所属 workspace。
 type ManagedWindow = {
   window: BrowserWindow;
   workspaceId: string;
 };
 
+// 集中管理 Electron 窗口的创建、查找和销毁清理。
 export class WindowManager {
-  // 用 webContents.id 找回对应窗口和它所属的 workspace。
+  // Map 的 key 是 Electron 为页面分配的 webContents.id；
+  // value 同时保存 BrowserWindow 和业务上的 workspaceId。
   private readonly windows = new Map<number, ManagedWindow>();
 
+  // 保存主入口提供的路径和运行模式，供 createWindow 使用。
   constructor(private readonly config: WindowManagerConfig) {}
 
+  // 为指定 workspace 创建一个桌面窗口，并返回窗口对象给调用方。
   createWindow(options: CreateWindowOptions): BrowserWindow {
     const window = new BrowserWindow({
+      // 默认窗口尺寸；minWidth/minHeight 限制用户不能缩得过小。
       width: 1400,
       height: 900,
       minWidth: 800,
       minHeight: 600,
-      // 等窗口第一帧准备好再显示，减少启动时的白屏闪烁。
+      // 先隐藏窗口，等页面首帧准备好再显示，减少白屏闪烁。
       show: false,
       webPreferences: {
+        // Preload 提供受控的主进程能力。
         preload: this.config.preloadPath,
+        // 隔离网页 JavaScript 环境，并禁止网页直接使用 Node.js API。
         contextIsolation: true,
         nodeIntegration: false,
       },
     });
 
+    // webContents.id 标识窗口中的网页上下文，用它作为 Map 的键。
     const windowId = window.webContents.id;
+    // 保存窗口记录，之后可以统一列出窗口或在关闭时移除它。
     this.windows.set(windowId, { window, workspaceId: options.workspaceId });
 
-    // 窗口关闭后从管理表移除，避免保留已销毁窗口。
+    // closed 事件只触发一次。窗口销毁后必须从 Map 删除，
+    // 否则管理器会一直持有已失效的窗口引用。
     window.once("closed", () => {
       this.windows.delete(windowId);
     });
 
-    // 页面首帧就绪后再显示窗口。
+    // ready-to-show 表示页面已经可以展示；此时再显示窗口。
     window.once("ready-to-show", () => window.show());
 
-    // 开发时加载 Vite 地址；打包后加载本地构建文件。
+    // 开发环境使用 Vite 热更新服务器；正式应用使用打包后的本地 HTML。
     if (this.config.isPackaged) {
+      // void 表明这里启动异步导航，但当前函数不等待页面加载完成。
       void window.loadFile(this.config.rendererFilePath);
     } else {
       void window.loadURL(this.config.rendererDevUrl);
@@ -60,6 +78,7 @@ export class WindowManager {
     return window;
   }
 
+  // 返回当前仍由管理器登记的所有窗口，忽略已关闭并清理的窗口。
   getWindows(): BrowserWindow[] {
     return Array.from(this.windows.values()).map(({ window }) => window);
   }
