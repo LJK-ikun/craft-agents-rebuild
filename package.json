@@ -4,5 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6"
   }
 }
