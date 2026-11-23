@@ -18,6 +18,18 @@ bun run src/index.ts
 
 For an OpenAI-compatible endpoint, set `OPENAI_BASE_URL` too.
 
+## Desktop shell
+
+Install project dependencies with `npm install`. Then start the renderer and desktop shell in two terminals:
+
+```powershell
+npm run dev:ui
+```
+
+```powershell
+npm run dev:desktop
+```
+
 ## Learning order
 
 1. Foundations and AI Agent basics
