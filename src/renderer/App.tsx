@@ -15,17 +15,22 @@ type Session = {
   createdAt: string;
   updatedAt: string;
   permissionMode?: "explore" | "ask" | "execute";
-  status?: "todo" | "in_progress" | "needs_review" | "done" | "cancelled";
+  sessionStatus?: string;
   isFlagged?: boolean;
 };
 
-// 把原版默认状态值转换为会话列表中显示的中文。
-const sessionStatusLabels: Record<NonNullable<Session["status"]>, string> = {
-  todo: "待办",
-  in_progress: "进行中",
-  needs_review: "待检查",
-  done: "已完成",
-  cancelled: "已取消",
+// 状态选项由当前工作区的 statuses/config.json 提供。
+type WorkspaceStatusConfig = {
+  version: number;
+  defaultStatusId: string;
+  statuses: Array<{
+    id: string;
+    label: string;
+    category: "open" | "closed";
+    isFixed: boolean;
+    isDefault: boolean;
+    order: number;
+  }>;
 };
 
 // Workspace 列表显示的基本信息。
@@ -46,6 +51,7 @@ type WorkspaceState = {
   toolActivities: ToolActivity[];
   sources: WorkspaceResource[];
   skills: WorkspaceResource[];
+  statusConfig: WorkspaceStatusConfig;
 };
 
 type WorkspaceResource = {
@@ -70,6 +76,11 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [sources, setSources] = useState<WorkspaceResource[]>([]);
   const [skills, setSkills] = useState<WorkspaceResource[]>([]);
+  const [statusConfig, setStatusConfig] = useState<WorkspaceStatusConfig>({
+    version: 1,
+    statuses: [],
+    defaultStatusId: "todo",
+  });
 
   // 保存当前会话的消息和输入框内容。
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -205,6 +216,7 @@ export function App() {
     setToolActivities(state.toolActivities);
     setSources(state.sources);
     setSkills(state.skills);
+    setStatusConfig(state.statusConfig);
     const activeSession = state.sessions.find((session) => session.id === state.activeSessionId);
     setPermissionMode(activeSession?.permissionMode ?? "ask");
     setPermissionRequests([]);
@@ -397,9 +409,9 @@ export function App() {
   }
 
   // 保存状态后用主进程返回的记录更新本地列表。
-  async function handleSessionStatusChange(sessionId: string, status: NonNullable<Session["status"]>) {
+  async function handleSessionStatusChange(sessionId: string, statusId: string) {
     try {
-      const updated = await window.craftAgent.setSessionStatus(sessionId, status);
+      const updated = await window.craftAgent.setSessionStatus(sessionId, statusId);
       setSessions((current) => current.map((session) => session.id === updated.id ? updated : session));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -456,16 +468,20 @@ export function App() {
               onClick={() => void handleSelectSession(session.id)}
               type="button"
             >
-              {session.isFlagged ? "★ " : ""}{session.title} · {sessionStatusLabels[session.status ?? "todo"]}
+              {session.isFlagged ? "★ " : ""}{session.title} · {
+                statusConfig.statuses.find((status) => status.id === session.sessionStatus)?.label
+                  ?? session.sessionStatus
+                  ?? statusConfig.defaultStatusId
+              }
             </button>
             <select
               aria-label={`设置 ${session.title} 的状态`}
               disabled={busy || loading}
-              onChange={(event) => void handleSessionStatusChange(session.id, event.target.value as NonNullable<Session["status"]>)}
-              value={session.status ?? "todo"}
+              onChange={(event) => void handleSessionStatusChange(session.id, event.target.value)}
+              value={session.sessionStatus ?? statusConfig.defaultStatusId}
             >
-              {Object.entries(sessionStatusLabels).map(([value, label]) => (
-                <option key={value} value={value}>{label}</option>
+              {statusConfig.statuses.map((status) => (
+                <option key={status.id} value={status.id}>{status.label}</option>
               ))}
             </select>
             <button

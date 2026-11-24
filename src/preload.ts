@@ -50,8 +50,8 @@ contextBridge.exposeInMainWorld("craftAgent", {
   listSessions: () => rpcClient.invoke("session:list"),
 
   // 修改会话的 Inbox 工作流状态。
-  setSessionStatus: (sessionId: string, status: "todo" | "in_progress" | "needs_review" | "done" | "cancelled") =>
-    rpcClient.invoke("session:set-status", sessionId, status),
+  setSessionStatus: (sessionId: string, statusId: string) =>
+    rpcClient.invoke("session:set-status", sessionId, statusId),
 
   // 修改会话的 Flag 标记。
   setSessionFlag: (sessionId: string, isFlagged: boolean) =>

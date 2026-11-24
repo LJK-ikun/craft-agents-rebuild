@@ -7,7 +7,6 @@ import {
   JsonlSessionStore,
   type ConversationMessage,
   type SessionRecord,
-  type SessionStatus,
 } from "./jsonl-store.ts";
 
 import { WorkspaceStore } from "./workspace-store.ts";
@@ -179,6 +178,7 @@ async function activateWorkspace(
     toolActivities,
     sources: await workspaceStore.listResources(workspace.id, "source"),
     skills: await workspaceStore.listResources(workspace.id, "skill"),
+    statusConfig: await workspaceStore.getStatusConfig(workspace.id),
   };
 }
 
@@ -205,6 +205,7 @@ async function restoreWorkspaceState(
         toolActivities: await runtime.sessionStore.loadToolActivities(sessionId),
         sources: await workspaceStore.listResources(workspaceId, "source"),
         skills: await workspaceStore.listResources(workspaceId, "skill"),
+        statusConfig: await workspaceStore.getStatusConfig(workspaceId),
       };
     }
   }
@@ -223,14 +224,15 @@ function registerRpcHandlers(server: CraftRpcServer): void {
 
   // 更新 Inbox 工作流状态；只接受原版默认状态集合中的值。
   server.handle("session:set-status", async (context, sessionId: unknown, status: unknown) => {
-    const store = getClientRuntime(context.clientId).sessionStore;
-    if (!store) throw new Error("请先选择工作区。");
+    const runtime = getClientRuntime(context.clientId);
+    const store = runtime.sessionStore;
+    if (!store || !runtime.activeWorkspaceId) throw new Error("请先选择工作区。");
     if (typeof sessionId !== "string") throw new Error("会话 ID 无效。");
-    const allowedStatuses: SessionStatus[] = ["todo", "in_progress", "needs_review", "done", "cancelled"];
-    if (typeof status !== "string" || !allowedStatuses.includes(status as SessionStatus)) {
+    const statusConfig = await workspaceStore.getStatusConfig(runtime.activeWorkspaceId);
+    if (typeof status !== "string" || !statusConfig.statuses.some((item) => item.id === status)) {
       throw new Error("会话状态无效。");
     }
-    return store.saveStatus(sessionId, status as SessionStatus);
+    return store.saveStatus(sessionId, status);
   });
 
   // 更新会话 Flag 标记；主进程检查类型后才修改持久化记录。

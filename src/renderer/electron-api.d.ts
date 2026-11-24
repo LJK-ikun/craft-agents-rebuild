@@ -18,7 +18,7 @@ type CraftSession = {
   createdAt: string;
   updatedAt: string;
   permissionMode?: "explore" | "ask" | "execute";
-  status?: "todo" | "in_progress" | "needs_review" | "done" | "cancelled";
+  sessionStatus?: string;
   isFlagged?: boolean;
 }
 
@@ -40,6 +40,20 @@ type CraftWorkspaceState = {
   toolActivities: ToolActivity[];
   sources: CraftWorkspaceResource[];
   skills: CraftWorkspaceResource[];
+  statusConfig: CraftWorkspaceStatusConfig;
+};
+
+type CraftWorkspaceStatusConfig = {
+  version: number;
+  defaultStatusId: string;
+  statuses: Array<{
+    id: string;
+    label: string;
+    category: "open" | "closed";
+    isFixed: boolean;
+    isDefault: boolean;
+    order: number;
+  }>;
 };
 
 type CraftWorkspaceResource = {
@@ -85,7 +99,7 @@ declare global {
       listSessions(): Promise<CraftSession[]>;
 
       // 修改一个会话的工作流状态，并返回保存后的会话记录。
-      setSessionStatus(sessionId: string, status: NonNullable<CraftSession["status"]>): Promise<CraftSession>;
+      setSessionStatus(sessionId: string, statusId: string): Promise<CraftSession>;
 
       // 修改会话的 Flag 标记，并返回保存后的会话记录。
       setSessionFlag(sessionId: string, isFlagged: boolean): Promise<CraftSession>;

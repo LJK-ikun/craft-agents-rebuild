@@ -15,8 +15,8 @@ export type ConversationMessage = {
   content: string;
 };
 
-// 与原版 Craft 默认工作流对应的会话状态。
-export type SessionStatus = "todo" | "in_progress" | "needs_review" | "done" | "cancelled";
+// 状态 ID 来自工作区配置，因此可以是原版内置项，也可以是用户自定义项。
+export type SessionStatus = string;
 
 // 描述会话列表里的一项。
 // 会话列表只存基本信息，具体聊天消息单独存在 JSONL 文件中。
@@ -27,7 +27,7 @@ export type SessionRecord = {
   updatedAt: string; // 最近一次保存消息的时间。
   sdkSessionId?: string; // Claude SDK 的会话 ID，用来在下次提问时恢复上下文。
   permissionMode?: "explore" | "ask" | "execute"; // 该会话的工具执行权限模式。
-  status?: SessionStatus; // Inbox 工作流状态；旧记录缺省时按 todo 显示。
+  sessionStatus?: SessionStatus; // 工作区配置中的状态 ID，例如 todo 或 needs-review。
   isFlagged?: boolean; // 是否被标记为重点会话。
 };
 
@@ -70,7 +70,24 @@ export class JsonlSessionStore {
       const text = await readFile(this.indexPath, "utf8");
 
       // 把 JSON 文字解析成会话记录数组并返回。
-      return JSON.parse(text) as SessionRecord[];
+      const storedSessions = JSON.parse(text) as Array<SessionRecord & { status?: string }>;
+      let migrated = false;
+      const sessions = storedSessions.map((session) => {
+        // fe29323 曾写入 status 和下划线 ID；这里迁移到原版的 sessionStatus 字段。
+        const oldStatus = session.status;
+        const legacyIdMap: Record<string, string> = {
+          in_progress: "in-progress",
+          needs_review: "needs-review",
+        };
+        const sessionStatus = session.sessionStatus ?? (oldStatus ? legacyIdMap[oldStatus] ?? oldStatus : "todo");
+        const { status: _oldStatus, ...currentSession } = session;
+        if (_oldStatus !== undefined || session.sessionStatus === undefined) migrated = true;
+        return { ...currentSession, sessionStatus };
+      });
+
+      // 兼容迁移只写会话索引，不修改消息 JSONL 或 Pi SDK 会话记录。
+      if (migrated) await this.saveSessions(sessions);
+      return sessions;
     } catch (error) {
       // ENOENT 表示文件或目录不存在，第一次运行时属于正常情况。
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -88,7 +105,7 @@ export class JsonlSessionStore {
       title: "默认会话",
       createdAt: now,
       updatedAt: now,
-      status: "todo",
+      sessionStatus: "todo",
       isFlagged: false,
     };
 
@@ -113,7 +130,7 @@ export class JsonlSessionStore {
       title: "新会话",
       createdAt: now,
       updatedAt: now,
-      status: "todo",
+      sessionStatus: "todo",
       isFlagged: false,
     };
 
@@ -157,7 +174,7 @@ export class JsonlSessionStore {
 
   // 更新会话在 Inbox 中的工作流状态，不修改聊天消息 JSONL。
   async saveStatus(sessionId: string, status: SessionStatus): Promise<SessionRecord> {
-    return this.updateSession(sessionId, { status });
+    return this.updateSession(sessionId, { sessionStatus: status });
   }
 
   // 更新会话是否被标记，供列表快速识别重要任务。
@@ -168,7 +185,7 @@ export class JsonlSessionStore {
   // 会话标题、状态、Flag 等元数据统一保存在 index.json。
   private async updateSession(
     sessionId: string,
-    changes: Partial<Pick<SessionRecord, "status" | "isFlagged">>,
+    changes: Partial<Pick<SessionRecord, "sessionStatus" | "isFlagged">>,
   ): Promise<SessionRecord> {
     const sessions = await this.listSessions();
     const sessionIndex = sessions.findIndex((session) => session.id === sessionId);

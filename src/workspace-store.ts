@@ -26,6 +26,39 @@ export type WorkspaceResource = {
   updatedAt: string;
 };
 
+// 原版 Craft 的一个工作区可以自定义状态显示和 Inbox/Archive 分类。
+export type WorkspaceStatus = {
+  id: string;
+  label: string;
+  color?: string;
+  icon?: string;
+  category: "open" | "closed";
+  isFixed: boolean;
+  isDefault: boolean;
+  order: number;
+};
+
+export type WorkspaceStatusConfig = {
+  version: number;
+  statuses: WorkspaceStatus[];
+  defaultStatusId: string;
+};
+
+// 默认值对齐原版 statuses/config.json 的五种状态。
+function defaultStatusConfig(): WorkspaceStatusConfig {
+  return {
+    version: 1,
+    statuses: [
+      { id: "backlog", label: "Backlog", category: "open", isFixed: false, isDefault: true, order: 0 },
+      { id: "todo", label: "Todo", category: "open", isFixed: true, isDefault: false, order: 1 },
+      { id: "needs-review", label: "Needs Review", category: "open", isFixed: false, isDefault: true, order: 2 },
+      { id: "done", label: "Done", category: "closed", isFixed: true, isDefault: false, order: 3 },
+      { id: "cancelled", label: "Cancelled", category: "closed", isFixed: true, isDefault: false, order: 4 },
+    ],
+    defaultStatusId: "todo",
+  };
+}
+
 // 负责工作区列表和单个工作区目录的读写。
 export class WorkspaceStore {
   // rootDirectory 是所有工作区资料的共同父目录。
@@ -96,6 +129,7 @@ export class WorkspaceStore {
     await mkdir(path.join(rootPath, "sessions"), { recursive: true });
     await mkdir(path.join(rootPath, "sources"), { recursive: true });
     await mkdir(path.join(rootPath, "skills"), { recursive: true });
+    await this.saveStatusConfigForRoot(rootPath, defaultStatusConfig());
 
     // 在工作区自己的目录中保存配置。
     await writeFile(
@@ -108,6 +142,56 @@ export class WorkspaceStore {
     await this.save([workspace, ...workspaces]);
 
     return workspace;
+  }
+
+  // 读取工作区状态配置；旧工作区缺文件时创建原版默认配置。
+  async getStatusConfig(workspaceId: string): Promise<WorkspaceStatusConfig> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const configPath = path.join(workspace.rootPath, "statuses", "config.json");
+
+    try {
+      const config = JSON.parse(await readFile(configPath, "utf8")) as WorkspaceStatusConfig;
+      if (!this.isValidStatusConfig(config)) return defaultStatusConfig();
+      return { ...config, statuses: [...config.statuses].sort((a, b) => a.order - b.order) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const defaults = defaultStatusConfig();
+      await this.saveStatusConfigForRoot(workspace.rootPath, defaults);
+      return defaults;
+    }
+  }
+
+  // 保存状态配置；检查默认状态和原版要求保留的固定状态仍然存在。
+  async saveStatusConfig(workspaceId: string, config: WorkspaceStatusConfig): Promise<void> {
+    if (!this.isValidStatusConfig(config)) throw new Error("工作区状态配置无效。");
+    const workspace = await this.getWorkspace(workspaceId);
+    await this.saveStatusConfigForRoot(workspace.rootPath, config);
+  }
+
+  private isValidStatusConfig(config: WorkspaceStatusConfig): boolean {
+    if (!config || !Array.isArray(config.statuses) || typeof config.defaultStatusId !== "string") return false;
+    if (!config.statuses.every((status) =>
+      status &&
+      typeof status.id === "string" &&
+      typeof status.label === "string" &&
+      (status.category === "open" || status.category === "closed") &&
+      typeof status.isFixed === "boolean" &&
+      typeof status.isDefault === "boolean" &&
+      typeof status.order === "number",
+    )) return false;
+    const ids = new Set(config.statuses.map((status) => status.id));
+    return ids.has(config.defaultStatusId) && ["todo", "done", "cancelled"].every((id) =>
+      config.statuses.some((status) => status.id === id && status.isFixed),
+    );
+  }
+
+  private async saveStatusConfigForRoot(
+    workspaceRoot: string,
+    config: WorkspaceStatusConfig,
+  ): Promise<void> {
+    const statusDirectory = path.join(workspaceRoot, "statuses");
+    await mkdir(statusDirectory, { recursive: true });
+    await writeFile(path.join(statusDirectory, "config.json"), JSON.stringify(config, null, 2), "utf8");
   }
 
   // 列出工作区中已导入的 Sources 文档或 Skills Markdown 文件。
