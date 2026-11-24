@@ -69,6 +69,8 @@ function createAgent(
       currentSessionStore.getSessionDirectory(session.id),
       ".pi-sessions",
     ),
+    // MCP 配置属于工作区，不混入会话历史；文件不存在时 Agent 继续使用内置工具。
+    mcpConfigPath: path.join(workingDirectory, ".craft", "mcp.json"),
     apiKey,
     workingDirectory,
     systemPrompt,

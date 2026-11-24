@@ -2,6 +2,7 @@ import { createInterface } from "node:readline";
 import { mkdir } from "node:fs/promises";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import {
   AuthStorage,
   ModelRegistry,
@@ -18,6 +19,9 @@ import {
   type AgentSession,
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Type, type TSchema } from "typebox";
 import { randomUUID } from "node:crypto";
 import { checkExploreBashCommand } from "./explore-bash-policy.ts";
 import type { AgentEvent } from "../types.ts";
@@ -32,6 +36,7 @@ type ServerRequest =
       apiKey: string;
       systemPrompt?: string;
       sessionDirectory?: string;
+      mcpConfigPath?: string;
       permissionMode?: "explore" | "ask" | "execute";
     }
   | { type: "ask"; id: string; message: string }
@@ -64,6 +69,8 @@ let workspaceRoot = "";
 const permissionWaiters = new Map<string, (approved: boolean) => void>();
 // 记录已请求中止的 prompt，避免 agent_end 被误报为正常完成。
 const cancelledRequestIds = new Set<string>();
+// 所有 MCP 客户端由 Pi 子进程持有，关闭会话时逐个关闭其 stdio 子进程。
+const mcpClients: Client[] = [];
 
 // 每行是一条独立 JSON 消息，逐条解析并交给对应处理函数。
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -180,8 +187,8 @@ async function initializeSession(
       ? await createPersistentSessionManager(request.cwd, request.sessionDirectory)
       : SessionManager.inMemory(request.cwd);
 
-    // Pi 自带的编码工具，先统一包一层权限确认，再交给 AgentSession。
-    const tools = [
+    // Pi 自带的编码工具与 MCP 工具共用一套权限确认包装。
+    const builtinTools = [
       createReadToolDefinition(request.cwd),
       createBashToolDefinition(request.cwd),
       createEditToolDefinition(request.cwd),
@@ -189,7 +196,13 @@ async function initializeSession(
       createGrepToolDefinition(request.cwd),
       createLsToolDefinition(request.cwd),
       createWriteToolDefinition(request.cwd),
-    ].map((tool) => wrapToolWithApproval(tool, workspaceRoot));
+    ];
+    const mcpTools = request.mcpConfigPath
+      ? await loadMcpTools(request.mcpConfigPath)
+      : [];
+    const tools = [...builtinTools, ...mcpTools].map((tool) =>
+      wrapToolWithApproval(tool, workspaceRoot),
+    );
 
     const created = await createAgentSession({
       cwd: request.cwd,
@@ -228,6 +241,87 @@ async function initializeSession(
     // 初始化失败后没有可复用的 session，及时退出让主进程得到明确失败状态。
     await shutdown();
   }
+}
+
+// 配置文件格式：{ "servers": { "name": { "command": "...", "args": [], "env": {} } }。
+type McpServerConfig = {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+};
+
+/** 连接工作区配置的 stdio MCP 服务，并把远端工具转换成 Pi 可执行工具。 */
+async function loadMcpTools(configPath: string): Promise<ToolDefinition<any, any, any>[]> {
+  let text: string;
+  try {
+    text = await readFile(configPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+
+  const parsed = JSON.parse(text) as { servers?: Record<string, McpServerConfig> };
+  const servers = parsed.servers ?? {};
+  const tools: ToolDefinition<any, any, any>[] = [];
+
+  for (const [serverName, config] of Object.entries(servers)) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(serverName)) {
+      throw new Error(`MCP 服务器名称只能包含英文、数字、下划线和短横线：${serverName}`);
+    }
+    if (typeof config.command !== "string" || !config.command.trim() || !Array.isArray(config.args ?? [])) {
+      throw new Error(`MCP 服务器 ${serverName} 必须提供有效的 command 和 args。`);
+    }
+
+    const client = new Client({ name: "craft-agents-rebuild", version: "0.1.0" });
+    const transport = new StdioClientTransport({
+      command: config.command,
+      args: config.args ?? [],
+      env: config.env,
+      cwd: workspaceRoot,
+      stderr: "inherit",
+    });
+
+    try {
+      await client.connect(transport);
+      mcpClients.push(client);
+      const discovered = await client.listTools();
+
+      for (const remoteTool of discovered.tools) {
+        const localName = `mcp__${serverName}__${remoteTool.name}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const inputSchema = remoteTool.inputSchema as TSchema;
+
+        tools.push({
+          name: localName,
+          label: `${serverName}: ${remoteTool.name}`,
+          description: remoteTool.description ?? `调用 ${serverName} MCP 服务器的 ${remoteTool.name} 工具。`,
+          // 保留 MCP 服务公布的 JSON Schema，让模型看见真实参数而非空壳结构。
+          parameters: Type.Unsafe(inputSchema),
+          async execute(_toolCallId, params) {
+            const result = await client.callTool({
+              name: remoteTool.name,
+              arguments: params as Record<string, unknown>,
+            });
+            const content = Array.isArray(result.content)
+              ? result.content as Array<{ type: string; text?: string }>
+              : [];
+            const output = content
+              .map((block) => block.type === "text" ? block.text : `[${block.type} 内容]`)
+              .join("\n");
+            if (result.isError) throw new Error(output || `MCP 工具执行失败：${remoteTool.name}`);
+            return {
+              content: [{ type: "text", text: output || "MCP 工具已完成，没有返回文本。" }],
+              details: undefined,
+            };
+          },
+        });
+      }
+    } catch (error) {
+      await client.close().catch(() => undefined);
+      throw new Error(`连接 MCP 服务器 ${serverName} 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return tools;
 }
 
 /** 工具真正执行前暂停，等待主进程把用户的允许/拒绝结果送回来。 */
@@ -467,6 +561,9 @@ async function shutdown(): Promise<void> {
 
   unsubscribe?.();
   unsubscribe = null;
+
+  // MCP transport 拥有它启动的 stdio 子进程，必须在 Agent 退出前显式关闭。
+  await Promise.all(mcpClients.splice(0).map((client) => client.close().catch(() => undefined)));
 
   try {
     await session?.dispose();

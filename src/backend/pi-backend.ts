@@ -132,6 +132,7 @@ export class PiBackend implements AgentBackend {
       apiKey: config.apiKey,
       systemPrompt: config.systemPrompt,
       sessionDirectory: config.piSessionDirectory,
+      mcpConfigPath: config.mcpConfigPath,
       permissionMode: config.permissionMode,
     });
   }

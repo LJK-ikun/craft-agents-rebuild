@@ -30,6 +30,23 @@ npm run dev:ui
 npm run dev:desktop
 ```
 
+## MCP stdio tools
+
+The desktop Agent can load local MCP stdio servers from `.craft/mcp.json` in the selected project folder. Example:
+
+```json
+{
+  "servers": {
+    "project-files": {
+      "command": "bun",
+      "args": ["x", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  }
+}
+```
+
+The server's tools are discovered when the Agent starts. In Ask mode, calling an MCP tool asks for approval through the same UI as built-in tools. In Explore mode, external MCP tools are blocked because the app cannot assume that a third-party tool is read-only. MCP servers are child processes, so only add commands you trust; keep credentials in `env` values outside committed project files.
+
 ## Learning order
 
 1. Foundations and AI Agent basics

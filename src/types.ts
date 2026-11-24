@@ -46,6 +46,8 @@ export type BackendConfig = {
   piAuthProvider?: string;
   // 当前 Craft 会话专属的 Pi 日志目录，用于恢复同一会话的上下文。
   piSessionDirectory?: string;
+  // 当前工作区的 MCP stdio 服务器配置文件；不存在时表示没有外部工具。
+  mcpConfigPath?: string;
   permissionMode?: "explore" | "ask" | "execute";
   apiKey: string;
   workingDirectory: string;
