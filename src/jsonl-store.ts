@@ -21,6 +21,7 @@ export type SessionRecord = {
   title: string; // 会话标题，显示在界面的会话列表中。
   createdAt: string; // 会话创建时间，使用 ISO 时间格式。
   updatedAt: string; // 最近一次保存消息的时间。
+  sdkSessionId?: string; // Claude SDK 的会话 ID，用来在下次提问时恢复上下文。
 };
 
 // 负责管理所有会话的本地文件。
@@ -39,6 +40,11 @@ export class JsonlSessionStore {
   // 例如 ID 是 "default"，路径会是 sessions/default/session.jsonl。
   private getSessionFilePath(sessionId: string): string {
     return path.join(this.rootDirectory, sessionId, "session.jsonl");
+  }
+
+  // 返回会话自己的目录，供 Pi SDK 在其中保存该会话的运行记录。
+  getSessionDirectory(sessionId: string): string {
+    return path.join(this.rootDirectory, sessionId);
   }
 
   // 读取所有会话的基本信息。
@@ -101,6 +107,23 @@ export class JsonlSessionStore {
 
     // 返回新会话信息，让主进程或界面可以切换到它。
     return session;
+  }
+
+  // 保存 Claude SDK 返回的会话 ID，确保应用重启后仍能恢复同一段对话。
+  async saveSdkSessionId(sessionId: string, sdkSessionId: string): Promise<void> {
+    const sessions = await this.listSessions();
+    const sessionIndex = sessions.findIndex((session) => session.id === sessionId);
+
+    if (sessionIndex === -1) {
+      throw new Error("找不到要保存 SDK 会话 ID 的会话。");
+    }
+
+    sessions[sessionIndex] = {
+      ...sessions[sessionIndex],
+      sdkSessionId,
+    };
+
+    await this.saveSessions(sessions);
   }
 
   // 读取指定会话中的全部消息。

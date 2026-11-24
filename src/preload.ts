@@ -1,10 +1,21 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
+import type { AgentEvent } from "./types.ts";
 
 // 目前先暴露一个只读的应用信息示例；后续再逐个增加安全 IPC 能力。
 contextBridge.exposeInMainWorld("craftAgent", {
   // 界面调用 ask 时， Preload 把问题送到主进程 agent:ask 通道，
   // invoke 会等主进程处理完，再把回答作为 Promise 返回给界面。
   ask: (userText: string): Promise<string> => ipcRenderer.invoke("agent:ask", userText),
+
+  // 只暴露 Agent 事件订阅方法，不把整个 ipcRenderer 交给网页。
+  onAgentEvent: (callback: (event: AgentEvent) => void): (() => void) => {
+    const listener = (_ipcEvent: IpcRendererEvent, event: AgentEvent) => {
+      callback(event);
+    };
+
+    ipcRenderer.on("agent:event", listener);
+    return () => ipcRenderer.removeListener("agent:event", listener);
+  },
 
   // 界面调用 getHistory 时，通过 IPC 向主进程请求历史消息。
   getHistory: (): Promise<

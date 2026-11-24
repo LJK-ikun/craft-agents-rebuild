@@ -47,6 +47,25 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
 
+  // 订阅主进程转发来的文本片段，并实时追加到最后一条助手消息。
+  useEffect(() => {
+    return window.craftAgent.onAgentEvent((event) => {
+      if (event.type !== "text_delta") return;
+
+      setMessages((current) => {
+        const lastMessage = current[current.length - 1];
+        if (lastMessage?.role === "assistant") {
+          return [
+            ...current.slice(0, -1),
+            { ...lastMessage, content: lastMessage.content + event.text },
+          ];
+        }
+
+        return [...current, { role: "assistant", content: event.text }];
+      });
+    });
+  }, []);
+
   // 界面首次打开时，读取 Workspace 列表并恢复第一个工作区。
   useEffect(() => {
     let cancelled = false;
@@ -188,18 +207,35 @@ export function App() {
 
     setBusy(true);
     setError("");
+    setMessages((current) => [
+      ...current,
+      { role: "user", content: text },
+      { role: "assistant", content: "" },
+    ]);
 
     try {
       const answer = await window.craftAgent.ask(text);
 
-      // 回答成功后，将本轮问答追加到当前界面。
-      setMessages((current) => [
-        ...current,
-        { role: "user", content: text },
-        { role: "assistant", content: answer },
-      ]);
+      // 用 IPC 最终返回值校准界面中的完整答案。
+      setMessages((current) => {
+        const lastMessage = current[current.length - 1];
+        if (lastMessage?.role === "assistant") {
+          return [
+            ...current.slice(0, -1),
+            { ...lastMessage, content: answer },
+          ];
+        }
+        return [...current, { role: "assistant", content: answer }];
+      });
       setQuestion("");
     } catch (cause) {
+      // 请求失败时移除尚未收到正文的空白回答占位。
+      setMessages((current) => {
+        const lastMessage = current[current.length - 1];
+        return lastMessage?.role === "assistant" && !lastMessage.content
+          ? current.slice(0, -1)
+          : current;
+      });
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);

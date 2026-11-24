@@ -2,13 +2,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import { createBackend } from "./backend/factory.ts";
-import type { AgentProvider, BackendConfig } from "./backend/types.ts";
 import {
   JsonlSessionStore,
   type ConversationMessage,
+  type SessionRecord,
 } from "./jsonl-store.ts";
 
 import { WorkspaceStore } from "./workspace-store.ts";
+import type { AgentProvider, BackendConfig } from "./types.ts";
 
 // 从 Electron 导入应用生命周期、窗口、目录选择框和 IPC 注册工具。
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
@@ -16,42 +17,55 @@ import { app, BrowserWindow, dialog, ipcMain } from "electron";
 const currentFile = fileURLToPath(import.meta.url);
 const currentDirectory = path.dirname(currentFile);
 
-// 后端与凭据仅从主进程环境变量读取，不暴露给网页。
-const backendName = (process.env.CRAFT_AGENT_BACKEND || "anthropic") as AgentProvider;
-const providerName = process.env.PI_PROVIDER || "anthropic";
-const apiKey =
-  backendName === "pi"
-    ? process.env.PI_API_KEY || process.env.ANTHROPIC_API_KEY
-    : process.env.ANTHROPIC_API_KEY;
+// 默认用 Pi SDK 管理 Agent；底层模型服务商可通过环境变量选择。
+const backendProvider: AgentProvider = "pi";
+const piAuthProvider = process.env.PI_AUTH_PROVIDER || "anthropic";
+const apiKey = process.env.PI_API_KEY || process.env.ANTHROPIC_API_KEY;
 const modelName =
-  backendName === "pi"
-    ? process.env.PI_MODEL || "claude-sonnet-4-6"
-    : process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+  process.env.PI_MODEL ||
+  process.env.ANTHROPIC_MODEL ||
+  "claude-sonnet-4-6";
+const systemPrompt = "你是一个简洁、准确的中文助手。";
 
 // 管理所有 Workspace 的注册信息。
 let workspaceStore!: WorkspaceStore;
 
 // 记录当前选中的 Workspace ID。
 let activeWorkspaceId: string | null = null;
-// 当前项目目录；read_file 工具只能在这个目录里读取文件。
+// 保存当前项目目录，供当前工作区创建模型后端时使用。
 let activeWorkingDirectory: string | null = null;
 // Agent、存储对象和当前会话 ID 都由主进程管理。
 let agent: Agent | null = null;
 let sessionStore: JsonlSessionStore | null = null;
 let activeSessionId: string | null = null;
 
-// 用指定会话的历史创建 Agent
-// 没有模型配置时返回null，应用仍可启动，但不能发送问题
-function createAgent(workingDirectory: string | null): Agent | null {
-  if (!apiKey || !modelName || !workingDirectory) return null;
+// 为一个应用会话创建 Agent，并把 Pi SDK 数据隔离到该会话的目录。
+function createAgent(
+  session: SessionRecord,
+  workingDirectory: string,
+  currentSessionStore: JsonlSessionStore,
+  messages: ConversationMessage[],
+): Agent | null {
+  if (!apiKey || !modelName) return null;
 
   const config: BackendConfig = {
-    workingDirectory,
+    provider: backendProvider,
     model: modelName,
+    piAuthProvider,
+    piSessionDirectory: path.join(
+      currentSessionStore.getSessionDirectory(session.id),
+      ".pi-sessions",
+    ),
     apiKey,
-    provider: providerName,
+    workingDirectory,
+    systemPrompt,
+    sdkSessionId: session.sdkSessionId,
+    initialHistory: messages,
+    onSdkSessionId: (sdkSessionId) =>
+      currentSessionStore.saveSdkSessionId(session.id, sdkSessionId),
   };
-  return new Agent(createBackend(backendName, config, currentDirectory));
+
+  return new Agent(createBackend(config));
 }
 
 // 切换到指定工作区，并加载它自己的会话和聊天历史。
@@ -71,18 +85,23 @@ async function activateWorkspace(workspaceId: string) {
 
   // 读取这个工作区的会话列表；首次使用时会创建默认会话。
   const sessions = await nextSessionStore.listSessions();
-  const sessionId = sessions[0].id;
+  const activeSession = sessions[0];
+  const sessionId = activeSession.id;
 
   // 读取默认会话的消息，并用它们创建 Agent。
   const messages = await nextSessionStore.loadMessages(sessionId);
 
   // 确认数据读取成功后，再把当前状态切换到目标工作区。
-  await agent?.dispose();
   activeWorkspaceId = workspace.id;
   activeWorkingDirectory = workspace.workingDirectory;
   activeSessionId = sessionId;
   sessionStore = nextSessionStore;
-  agent = createAgent(activeWorkingDirectory);
+  agent = createAgent(
+    activeSession,
+    workspace.workingDirectory,
+    nextSessionStore,
+    messages,
+  );
 
   // 把界面需要展示的数据返回给调用方。
   return {
@@ -103,16 +122,16 @@ ipcMain.handle("session:list", async () => {
 // 界面请求新建会话时，主进程创建记录并切换到这个空会话。
 ipcMain.handle("session:create", async () => {
   if (!sessionStore) throw new Error("会话存储尚未初始化。");
+  if (!activeWorkingDirectory) throw new Error("当前工作区尚未初始化。");
 
   // 在索引里创建会话记录，并取得新会话的唯一 ID。
   const session = await sessionStore.createSession();
 
   // 更新当前会话 ID，后续发送的问题就会保存到这个会话。
-  await agent?.dispose();
   activeSessionId = session.id;
 
   // 新会话没有历史消息，因此创建一个空历史的 Agent。
-  agent = createAgent(activeWorkingDirectory);
+  agent = createAgent(session, activeWorkingDirectory, sessionStore, []);
 
   // 把新会话资料和空消息列表交还给界面。
   return { session, messages: [] };
@@ -126,11 +145,19 @@ ipcMain.handle("session:select", async (_event, sessionId: unknown) => {
   }
 
   const messages = await sessionStore.loadMessages(sessionId)
+  const sessions = await sessionStore.listSessions();
+  const selectedSession = sessions.find((session) => session.id === sessionId);
+  if (!selectedSession) throw new Error("找不到指定会话。");
+  if (!activeWorkingDirectory) throw new Error("当前工作区尚未初始化。");
 
   // 成功读到目标绘画后，再更新当前会话状态
-  await agent?.dispose();
   activeSessionId = sessionId;
-  agent = createAgent(activeWorkingDirectory)
+  agent = createAgent(
+    selectedSession,
+    activeWorkingDirectory,
+    sessionStore,
+    messages,
+  )
 
   return messages
 })
@@ -173,14 +200,15 @@ ipcMain.handle("session:history", async () => {
 });
 
 // 界面发送问题时，调用当前会话的 Agent，并把问答保存到当前会话。
-ipcMain.handle("agent:ask", async (_event, userText: unknown): Promise<string> => {
+ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> => {
   if (typeof userText !== "string" || !userText.trim()) {
     throw new Error("请输入有效的问题。");
   }
   if (!sessionStore) throw new Error("会话存储尚未初始化。");
   if (!agent) {
-    const expectedKey = backendName === "pi" ? "PI_API_KEY" : "ANTHROPIC_API_KEY";
-    throw new Error(`请先设置 ${expectedKey}。`);
+    throw new Error(
+      "请设置 PI_API_KEY（或 ANTHROPIC_API_KEY）；可选设置 PI_AUTH_PROVIDER 和 PI_MODEL。",
+    );
   }
   if (!activeSessionId) throw new Error("当前没有选中的会话。");
 
@@ -190,7 +218,22 @@ ipcMain.handle("agent:ask", async (_event, userText: unknown): Promise<string> =
   const sessionId = activeSessionId;
   const question = userText.trim();
 
-  const answer = await currentAgent.ask(question);
+  const answerParts: string[] = [];
+
+  // 一边读取后端事件，一边发给 Renderer；同时收集文本用于历史存储。
+  for await (const agentEvent of currentAgent.chat(question)) {
+    event.sender.send("agent:event", agentEvent);
+
+    if (agentEvent.type === "text_delta") {
+      answerParts.push(agentEvent.text);
+    }
+
+    if (agentEvent.type === "error") {
+      throw new Error(agentEvent.message);
+    }
+  }
+
+  const answer = answerParts.join("");
 
   // 两条消息都写入刚才发起请求的那个会话。
   await currentSessionStore.appendMessage(sessionId, {

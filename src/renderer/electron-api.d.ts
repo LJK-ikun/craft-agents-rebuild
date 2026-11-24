@@ -1,5 +1,6 @@
 // 让TypeScript 把本文件当作模块
 // 这样下面才能使用 declare global 拓展全局 Window 类型
+import type { AgentEvent } from "../types.ts";
 export {};
 
 // 描述一条聊天消息，和主进程，存储层使用的数据结构一致
@@ -40,6 +41,9 @@ declare global {
     craftAgent: {
       // 发送问题，异步取得模型回答
       ask(userText: string): Promise<string>;
+
+      // 订阅模型运行事件；返回函数用于取消订阅。
+      onAgentEvent(callback: (event: AgentEvent) => void): () => void;
 
       // 读取当前会话的历史消息
       getHistory(): Promise<CraftChatMessage[]>;

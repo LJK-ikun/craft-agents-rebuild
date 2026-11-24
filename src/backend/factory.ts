@@ -1,21 +1,15 @@
 import { ClaudeBackend } from "./claude-backend.ts";
-import { PiBackend, resolvePiServerScript } from "./pi-backend.ts";
-import type { AgentBackend, AgentProvider, BackendConfig } from "./types.ts";
+import { PiBackend } from "./pi-backend.ts";
+import type { AgentBackend, BackendConfig } from "../types.ts";
 
-// 集中决定使用哪个 SDK 后端；UI/主进程不需要知道 SDK 的构造细节。
-export function createBackend(
-  provider: AgentProvider,
-  config: BackendConfig,
-  mainDirectory: string,
-): AgentBackend {
-  switch (provider) {
+// 根据 provider 选择具体后端；调用方只依赖 AgentBackend 接口。
+export function createBackend(config: BackendConfig): AgentBackend {
+  switch (config.provider) {
     case "anthropic":
       return new ClaudeBackend(config);
+
     case "pi":
-      return new PiBackend(config, resolvePiServerScript(mainDirectory));
-    default: {
-      const exhaustiveCheck: never = provider;
-      throw new Error(`不支持的 Agent 后端：${exhaustiveCheck}`);
-    }
+      // PiBackend 把 Pi SDK 的会话事件转换成应用统一的 AgentEvent。
+      return new PiBackend(config);
   }
 }

@@ -1,125 +1,153 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
-import { randomUUID } from "node:crypto";
-import type { AgentBackend, BackendConfig } from "./types.ts";
+import type {
+  AgentSession,
+  AgentSessionEvent,
+} from "@earendil-works/pi-coding-agent";
+import { createPiSession } from "./pi-session.ts";
+import type {
+  AgentBackend,
+  AgentEvent,
+  BackendConfig,
+} from "../types.ts";
 
-type PiResponse =
-  | { type: "ready" }
-  | { type: "answer"; id: string; answer: string }
-  | { type: "error"; id?: string; error: string };
+/**
+ * 一个很小的异步事件队列：
+ * Pi 通过回调推送事件，AgentBackend.chat() 则通过 async generator 逐条读取。
+ */
+class AgentEventQueue implements AsyncIterable<AgentEvent> {
+  // 暂时还没有消费者读取的事件。
+  private readonly events: AgentEvent[] = [];
+  // 正在等待下一条事件的读取者。
+  private readonly waiters: Array<(event: AgentEvent | null) => void> = [];
+  // 事件结束后阻止队列继续接收新事件。
+  private closed = false;
 
-// PiBackend 是 Electron 主进程里的客户端；真正的 Pi SDK 在 Bun 子进程运行。
-export class PiBackend implements AgentBackend {
-  private readonly child: ChildProcessWithoutNullStreams;
-  private readonly pending = new Map<
-    string,
-    { resolve: (answer: string) => void; reject: (error: Error) => void }
-  >();
-  private readonly ready: Promise<void>;
+  /** 把事件交给一个等待者，或先放进队列等待读取。 */
+  push(event: AgentEvent): void {
+    if (this.closed) return;
 
-  constructor(config: BackendConfig, serverScript: string) {
-    // Bun 运行时满足 Pi SDK 的运行要求，并与 Electron 的 Node 环境隔离。
-    this.child = spawn(process.env.BUN_EXECUTABLE || "bun", ["run", serverScript], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-
-    const lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
-    lines.on("line", (line) => this.handleResponse(line));
-
-    this.child.stderr.on("data", (chunk: Buffer) => {
-      console.error(`[Pi backend] ${chunk.toString().trimEnd()}`);
-    });
-
-    this.child.on("exit", (code) => {
-      const error = new Error(`Pi 服务进程已退出（${code ?? "unknown"}）。`);
-      for (const request of this.pending.values()) request.reject(error);
-      this.pending.clear();
-    });
-
-    this.ready = this.waitForReady();
-    this.write({
-      type: "init",
-      cwd: config.workingDirectory,
-      provider: config.provider || "anthropic",
-      model: config.model,
-      apiKey: config.apiKey,
-    });
-  }
-
-  async ask(message: string): Promise<string> {
-    await this.ready;
-    const id = randomUUID();
-
-    return new Promise<string>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.write({ type: "ask", id, message });
-    });
-  }
-
-  async dispose(): Promise<void> {
-    if (this.child.exitCode !== null) return;
-    this.write({ type: "close" });
-    this.child.kill();
-  }
-
-  private async waitForReady(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const onResponse = (response: PiResponse) => {
-        if (response.type === "ready") {
-          this.removeResponseListener(onResponse);
-          resolve();
-        } else if (response.type === "error") {
-          this.removeResponseListener(onResponse);
-          reject(new Error(response.error));
-        }
-      };
-
-      this.addResponseListener(onResponse);
-      this.child.once("error", (error) => {
-        this.removeResponseListener(onResponse);
-        reject(error);
-      });
-    });
-  }
-
-  private readonly responseListeners = new Set<(response: PiResponse) => void>();
-
-  private addResponseListener(listener: (response: PiResponse) => void): void {
-    this.responseListeners.add(listener);
-  }
-
-  private removeResponseListener(listener: (response: PiResponse) => void): void {
-    this.responseListeners.delete(listener);
-  }
-
-  private handleResponse(line: string): void {
-    let response: PiResponse;
-    try {
-      response = JSON.parse(line) as PiResponse;
-    } catch {
-      console.error("Pi 服务返回了无效的 JSONL。", line);
-      return;
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(event);
+    } else {
+      this.events.push(event);
     }
-
-    for (const listener of this.responseListeners) listener(response);
-
-    if (!response.id) return;
-    const request = this.pending.get(response.id);
-    if (!request) return;
-    this.pending.delete(response.id);
-
-    if (response.type === "answer") request.resolve(response.answer);
-    if (response.type === "error") request.reject(new Error(response.error));
   }
 
-  private write(value: object): void {
-    if (this.child.stdin.destroyed) throw new Error("Pi 服务进程输入流已关闭。");
-    this.child.stdin.write(`${JSON.stringify(value)}\n`);
+  /** 标记队列结束，并唤醒所有等待中的读取者。 */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.(null);
+    }
+  }
+
+  /** 允许调用方使用 for await 按顺序消费所有事件。 */
+  async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
+    while (true) {
+      const savedEvent = this.events.shift();
+      if (savedEvent) {
+        yield savedEvent;
+        continue;
+      }
+
+      if (this.closed) return;
+
+      const nextEvent = await new Promise<AgentEvent | null>((resolve) => {
+        this.waiters.push(resolve);
+      });
+
+      if (nextEvent === null) return;
+      yield nextEvent;
+    }
   }
 }
 
-// 开发构建把 main.mjs 放在 dist，因此 Pi server 的 TypeScript 源位于上一级 src。
-export function resolvePiServerScript(mainDirectory: string): string {
-  return `${mainDirectory}/backend/pi-agent-server.js`;
+/** 把 Pi SDK 的会话事件转换成应用统一的 AgentEvent。 */
+export class PiBackend implements AgentBackend {
+  // 延迟创建 Pi 会话，并在本后端实例的整个生命周期内复用它。
+  private sessionPromise: Promise<AgentSession> | null = null;
+
+  constructor(private readonly config: BackendConfig) {}
+
+  /** 第一次提问时创建 Pi 会话；后续提问继续使用同一个会话。 */
+  private getSession(): Promise<AgentSession> {
+    if (!this.sessionPromise) {
+      this.sessionPromise = createPiSession(this.config);
+    }
+    return this.sessionPromise;
+  }
+
+  /** 发送用户问题，并把 Pi 的流式输出逐条交给主进程。 */
+  async *chat(message: string): AsyncGenerator<AgentEvent> {
+    let session: AgentSession;
+
+    // 会话初始化失败也转换成统一错误事件，避免泄漏 SDK 错误对象。
+    try {
+      session = await this.getSession();
+    } catch (error) {
+      yield {
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
+      return;
+    }
+
+    const queue = new AgentEventQueue();
+
+    // 监听 Pi SDK 事件，并只挑当前应用需要的事件转换。
+    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      // message_update 的 text_delta 是模型刚生成的一段文字。
+      if (
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "text_delta"
+      ) {
+        queue.push({
+          type: "text_delta",
+          text: event.assistantMessageEvent.delta,
+        });
+      }
+
+      // assistant 消息以 error 结束时，把错误文本交给应用层。
+      if (
+        event.type === "message_end" &&
+        event.message.role === "assistant" &&
+        event.message.stopReason === "error"
+      ) {
+        queue.push({
+          type: "error",
+          message: event.message.errorMessage || "Pi 模型请求失败。",
+        });
+      }
+
+      // agent_end 表示这一轮 Pi Agent 工作结束。
+      if (event.type === "agent_end") {
+        queue.push({ type: "complete" });
+        queue.close();
+      }
+    });
+
+    try {
+      // prompt 启动 Pi 的模型循环；SDK 事件由上方订阅回调推入队列。
+      const promptTask = session.prompt(message).catch((error: unknown) => {
+        queue.push({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        queue.close();
+      });
+
+      // Pi 每产生一条文字事件，就立即 yield 给 Electron 主进程。
+      for await (const event of queue) {
+        yield event;
+      }
+
+      // 等待 prompt 本身结束，避免后台请求还没收尾就退出。
+      await promptTask;
+    } finally {
+      // 每轮结束后取消订阅，避免后续问题收到重复事件。
+      unsubscribe();
+    }
+  }
 }

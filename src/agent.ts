@@ -1,16 +1,23 @@
-import type { AgentBackend } from "./backend/types.ts";
+import type { AgentBackend, AgentEvent } from "./types.ts";
 
-// Agent 作为主进程使用的薄门面，把具体工作交给选中的 SDK 后端。
-export class Agent {
+// Agent 是应用侧门面：它不绑定 Claude 或 Pi 的 SDK。
+export class Agent implements AgentBackend {
   constructor(private readonly backend: AgentBackend) {}
 
-  // 后端内部会运行对应 SDK 的模型与工具循环。
-  ask(message: string): Promise<string> {
-    return this.backend.ask(message);
+  // 把后端事件流原样交给上层调用者。
+  chat(message: string): AsyncGenerator<AgentEvent> {
+    return this.backend.chat(message);
   }
 
-  // 切换 Workspace 或会话时释放旧后端资源。
-  dispose(): Promise<void> {
-    return this.backend.dispose();
+  // 旧主进程暂时仍用 ask；这里把事件流中的文本收集成完整答案。
+  async ask(message: string): Promise<string> {
+    let answer = "";
+
+    for await (const event of this.chat(message)) {
+      if (event.type === "text_delta") answer += event.text;
+      if (event.type === "error") throw new Error(event.message);
+    }
+
+    return answer;
   }
 }
