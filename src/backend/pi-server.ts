@@ -19,6 +19,7 @@ import {
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { checkExploreBashCommand } from "./explore-bash-policy.ts";
 import type { AgentEvent } from "../types.ts";
 
 // 主进程发给 Pi 子进程的消息类型。
@@ -285,6 +286,14 @@ function wrapToolWithApproval(
 
       // 所有文件类工具只能访问工作区内的路径，且要检查符号链接的真实目标。
       await assertToolPathsInsideWorkspace(tool.name, input, allowedRoot);
+
+      // Explore 下只放行 AST 检查通过的只读 Bash 命令。
+      if (tool.name === "bash" && permissionMode === "explore") {
+        const command = typeof input.command === "string" ? input.command : "";
+        const decision = checkExploreBashCommand(command);
+        if (!decision.allowed) throw new Error(decision.reason);
+        return execute(toolCallId, params, signal, onUpdate, context);
+      }
 
       // Explore 模式仅允许读取；Ask 模式中读取不打断用户，写入和命令需确认。
       if (permissionMode === "explore" && !isReadOnly) {
