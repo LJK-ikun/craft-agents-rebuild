@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { AgentEvent } from "./types.ts";
 import { CraftRpcClient } from "./transport/rpc-client.ts";
+import type { RpcConnectionState } from "./transport/rpc-client.ts";
 import type { RpcBootstrap } from "./transport/rpc-types.ts";
 
 // 启动时用一次同步 IPC 获取本地 WebSocket 地址和令牌；业务请求随后走 RPC。
@@ -32,6 +33,13 @@ contextBridge.exposeInMainWorld("craftAgent", {
   // 事件缓存已经过期时通知 Renderer；由界面重新读取当前工作区和会话。
   onTransportStale: (callback: () => void): (() => void) =>
     rpcClient.on("transport:stale", callback),
+
+  // 暴露连接状态订阅，供界面显示连接中、已连接或正在重连。
+  onConnectionStateChanged: (callback: (state: RpcConnectionState) => void): (() => void) =>
+    rpcClient.onConnectionStateChanged(callback),
+
+  // 允许界面或路由器在调用前检查服务器是否注册了该频道。
+  isChannelAvailable: (channel: string): boolean => rpcClient.isChannelAvailable(channel),
 
   // 通过 RPC 读取当前会话的历史消息。
   getHistory: (): Promise<

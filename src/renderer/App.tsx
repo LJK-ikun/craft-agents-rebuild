@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import type { ToolActivity } from "../types.ts";
+import type { RpcConnectionState } from "../transport/rpc-client.ts";
 
 // 一条聊天消息由说话人和文字内容组成。
 type ChatMessage = {
@@ -62,6 +63,10 @@ export function App() {
   const [cancelling, setCancelling] = useState(false);
   const [cancelNotice, setCancelNotice] = useState("");
   const [loading, setLoading] = useState(true);
+  const [rpcState, setRpcState] = useState<RpcConnectionState>({ status: "connecting", attempt: 0 });
+
+  // RPC 客户端状态独立于 Agent 请求状态；断线期间提示用户正在恢复连接。
+  useEffect(() => window.craftAgent.onConnectionStateChanged(setRpcState), []);
 
   // 订阅主进程转发来的文本片段，并实时追加到最后一条助手消息。
   useEffect(() => {
@@ -399,6 +404,15 @@ export function App() {
 
       <section style={{ flex: 1 }}>
         <h1>Craft Agents Learning Rebuild</h1>
+        <p aria-live="polite" role="status">
+          RPC：{rpcState.status === "connected"
+            ? "已连接"
+            : rpcState.status === "reconnecting"
+              ? `正在重连（第 ${rpcState.attempt} 次）`
+              : rpcState.status === "connecting"
+                ? "连接中"
+                : "已断开"}
+        </p>
 
         <label>
           工具权限：

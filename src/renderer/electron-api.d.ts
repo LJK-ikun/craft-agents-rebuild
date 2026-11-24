@@ -2,6 +2,7 @@
 // 这样下面才能使用 declare global 拓展全局 Window 类型
 import type { AgentEvent } from "../types.ts";
 import type { ToolActivity } from "../types.ts";
+import type { RpcConnectionState } from "../transport/rpc-client.ts";
 export {};
 
 // 描述一条聊天消息，和主进程，存储层使用的数据结构一致
@@ -59,6 +60,12 @@ declare global {
 
       // 事件缓存过期、需要完整刷新时收到通知。
       onTransportStale(callback: () => void): () => void;
+
+      // 观察 WebSocket-RPC 的连接状态变化。
+      onConnectionStateChanged(callback: (state: RpcConnectionState) => void): () => void;
+
+      // 检查服务端握手时公布的频道列表。
+      isChannelAvailable(channel: string): boolean;
 
       // 读取当前会话的历史消息
       getHistory(): Promise<CraftChatMessage[]>;

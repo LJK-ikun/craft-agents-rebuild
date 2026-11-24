@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { RpcBootstrap, RpcMessage, RpcRequestContext } from "./rpc-types.ts";
+import { RPC_PROTOCOL_VERSION, type RpcBootstrap, type RpcMessage, type RpcRequestContext } from "./rpc-types.ts";
 
 type RpcHandler = (context: RpcRequestContext, ...args: unknown[]) => unknown | Promise<unknown>;
 
@@ -26,6 +26,7 @@ const EVENT_BUFFER_TTL_MS = 30_000;
 const DISCONNECTED_CLIENT_TTL_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_MAX_MISSED = 2;
+const SERVER_VERSION = "0.1.0-rebuild";
 
 /** 本地 WebSocket-RPC 服务：负责调用、客户端恢复、可靠事件推送和心跳。 */
 export class CraftRpcServer {
@@ -159,10 +160,12 @@ export class CraftRpcServer {
           this.send(socket, {
             type: "handshake_ack",
             id: handshakeId,
-            protocolVersion: 1,
+            protocolVersion: RPC_PROTOCOL_VERSION,
             clientId: client.id,
             reconnected,
             stale,
+            registeredChannels: [...this.handlers.keys()],
+            serverVersion: SERVER_VERSION,
           });
           this.clients.set(client.id, client);
           for (const listener of this.connectListeners) listener(client.id);
@@ -188,7 +191,21 @@ export class CraftRpcServer {
     }
 
     if (message.type === "handshake") {
-      if (message.protocolVersion !== 1 || message.token !== this.token) {
+      if (message.protocolVersion !== RPC_PROTOCOL_VERSION) {
+        this.send(socket, {
+          type: "error",
+          id: message.id,
+          error: { code: "PROTOCOL_VERSION_UNSUPPORTED", message: "RPC 协议版本不受支持。" },
+        });
+        socket.close(4001, "RPC 协议版本不兼容");
+        return;
+      }
+      if (message.token !== this.token) {
+        this.send(socket, {
+          type: "error",
+          id: message.id,
+          error: { code: "AUTH_FAILED", message: "RPC 握手令牌无效。" },
+        });
         socket.close(4001, "RPC 握手验证失败");
         return;
       }
@@ -264,7 +281,11 @@ export class CraftRpcServer {
     if (message.type !== "request") return;
     const handler = this.handlers.get(message.channel);
     if (!handler) {
-      this.send(socket, { type: "error", id: message.id, error: { message: `找不到 RPC 频道：${message.channel}` } });
+      this.send(socket, {
+        type: "error",
+        id: message.id,
+        error: { code: "CHANNEL_NOT_FOUND", message: `找不到 RPC 频道：${message.channel}` },
+      });
       return;
     }
 
@@ -282,7 +303,10 @@ export class CraftRpcServer {
       this.send(responseSocket, {
         type: "error",
         id: message.id,
-        error: { message: error instanceof Error ? error.message : String(error) },
+        error: {
+          code: "HANDLER_ERROR",
+          message: error instanceof Error ? error.message : String(error),
+        },
       });
     }
   }

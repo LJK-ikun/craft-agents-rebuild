@@ -1,10 +1,18 @@
 // RPC 消息类型：客户端和服务端共享这套 JSON 结构。
+export const RPC_PROTOCOL_VERSION = "1.0";
+
+export type RpcError = {
+  code: string;
+  message: string;
+  data?: unknown;
+};
+
 export type RpcMessage =
   | {
       type: "handshake";
       id: string;
       token: string;
-      protocolVersion: 1;
+      protocolVersion: string;
       webContentsId?: number;
       workspaceId?: string;
       reconnectClientId?: string;
@@ -13,16 +21,18 @@ export type RpcMessage =
   | {
       type: "handshake_ack";
       id: string;
-      protocolVersion: 1;
+      protocolVersion: string;
       clientId: string;
       reconnected?: boolean;
       stale?: boolean;
+      registeredChannels?: string[];
+      serverVersion?: string;
     }
   | { type: "request"; id: string; channel: string; args: unknown[] }
   | { type: "event"; id: string; channel: string; args: unknown[]; seq?: number }
   | { type: "sequence_ack"; id: string; lastSeq: number }
   | { type: "response"; id: string; result: unknown }
-  | { type: "error"; id: string; error: { message: string } };
+  | { type: "error"; id: string; error: RpcError };
 
 // 让后端 handler 知道请求来自哪个已握手的桌面客户端。
 export type RpcRequestContext = {
