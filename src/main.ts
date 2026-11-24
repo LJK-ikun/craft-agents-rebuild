@@ -176,6 +176,8 @@ async function activateWorkspace(
     activeSessionId: sessionId,
     messages,
     toolActivities,
+    sources: await workspaceStore.listResources(workspace.id, "source"),
+    skills: await workspaceStore.listResources(workspace.id, "skill"),
   };
 }
 
@@ -200,6 +202,8 @@ async function restoreWorkspaceState(
         activeSessionId: sessionId,
         messages: await runtime.sessionStore.loadMessages(sessionId),
         toolActivities: await runtime.sessionStore.loadToolActivities(sessionId),
+        sources: await workspaceStore.listResources(workspaceId, "source"),
+        skills: await workspaceStore.listResources(workspaceId, "skill"),
       };
     }
   }
@@ -260,6 +264,28 @@ function registerRpcHandlers(server: CraftRpcServer): void {
     if (result.canceled || !result.filePaths[0]) return null;
     const workspace = await workspaceStore.addWorkspace(result.filePaths[0]);
     return activateWorkspace(workspace.id, getClientRuntime(context.clientId));
+  });
+
+  // 文件选择框由主进程持有；Renderer 只指定导入成知识文件还是 Skill。
+  server.handle("workspace:add-resource", async (context, kind: unknown) => {
+    if (kind !== "source" && kind !== "skill") throw new Error("资源类型无效。");
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.activeWorkspaceId) throw new Error("请先选择工作区。");
+
+    const result = await dialog.showOpenDialog({
+      title: kind === "skill" ? "导入 Skill Markdown" : "导入知识文件",
+      properties: ["openFile", "multiSelections"],
+      filters: [{
+        name: kind === "skill" ? "Markdown" : "Markdown 与文本",
+        extensions: kind === "skill" ? ["md"] : ["md", "txt"],
+      }],
+    });
+    if (result.canceled) return workspaceStore.listResources(runtime.activeWorkspaceId, kind);
+
+    for (const sourcePath of result.filePaths) {
+      await workspaceStore.addResource(runtime.activeWorkspaceId, kind, sourcePath);
+    }
+    return workspaceStore.listResources(runtime.activeWorkspaceId, kind);
   });
 
   // 选择工作区后只更新发起该 RPC 请求的客户端状态。

@@ -33,6 +33,15 @@ type WorkspaceState = {
   activeSessionId: string;
   messages: ChatMessage[];
   toolActivities: ToolActivity[];
+  sources: WorkspaceResource[];
+  skills: WorkspaceResource[];
+};
+
+type WorkspaceResource = {
+  name: string;
+  kind: "source" | "skill";
+  size: number;
+  updatedAt: string;
 };
 
 // 等待用户批准的工具请求：工具名和参数都来自本地 Agent 运行时。
@@ -48,6 +57,8 @@ export function App() {
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sources, setSources] = useState<WorkspaceResource[]>([]);
+  const [skills, setSkills] = useState<WorkspaceResource[]>([]);
 
   // 保存当前会话的消息和输入框内容。
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -181,10 +192,28 @@ export function App() {
     setActiveSessionId(state.activeSessionId);
     setMessages(state.messages);
     setToolActivities(state.toolActivities);
+    setSources(state.sources);
+    setSkills(state.skills);
     const activeSession = state.sessions.find((session) => session.id === state.activeSessionId);
     setPermissionMode(activeSession?.permissionMode ?? "ask");
     setPermissionRequests([]);
     setQuestion("");
+  }
+
+  // 把选中的 Markdown/TXT 文件导入当前工作区，并刷新对应资源列表。
+  async function handleAddResource(kind: "source" | "skill") {
+    if (busy || loading || !activeWorkspaceId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const resources = await window.craftAgent.addWorkspaceResource(kind);
+      if (kind === "source") setSources(resources);
+      else setSkills(resources);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
   }
 
   // 弹出文件夹选择框，创建 Workspace 并切换过去。
@@ -400,6 +429,26 @@ export function App() {
             {session.title}
           </button>
         ))}
+
+        <h2>Sources</h2>
+        <button
+          disabled={busy || loading || !activeWorkspaceId}
+          onClick={() => void handleAddResource("source")}
+          type="button"
+        >
+          导入知识文件
+        </button>
+        {sources.map((source) => <p key={source.name}>{source.name}</p>)}
+
+        <h2>Skills</h2>
+        <button
+          disabled={busy || loading || !activeWorkspaceId}
+          onClick={() => void handleAddResource("skill")}
+          type="button"
+        >
+          导入 Skill
+        </button>
+        {skills.map((skill) => <p key={skill.name}>{skill.name}</p>)}
       </aside>
 
       <section style={{ flex: 1 }}>

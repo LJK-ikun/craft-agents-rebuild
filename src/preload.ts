@@ -62,6 +62,10 @@ contextBridge.exposeInMainWorld("craftAgent", {
   // 弹出目录选择框并添加工作区；用户取消时主进程返回 null。
   addWorkspace: () => rpcClient.invoke("workspace:add"),
 
+  // 由主进程弹出文件选择框并导入知识文档或 Skill Markdown。
+  addWorkspaceResource: (kind: "source" | "skill") =>
+    rpcClient.invoke("workspace:add-resource", kind),
+
   // 切换工作区，并取得该工作区当前会话和聊天记录。
   selectWorkspace: (workspaceId: string) =>
     rpcClient.invoke("workspace:select", workspaceId),

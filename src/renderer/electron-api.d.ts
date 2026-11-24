@@ -36,6 +36,15 @@ type CraftWorkspaceState = {
   activeSessionId: string;
   messages: CraftChatMessage[];
   toolActivities: ToolActivity[];
+  sources: CraftWorkspaceResource[];
+  skills: CraftWorkspaceResource[];
+};
+
+type CraftWorkspaceResource = {
+  name: string;
+  kind: "source" | "skill";
+  size: number;
+  updatedAt: string;
 };
 
 // 扩展浏览器环境中的全局 Window 类型
@@ -90,6 +99,9 @@ declare global {
 
       // 选择文件夹并添加工作区；用户取消时返回 null。
       addWorkspace(): Promise<CraftWorkspaceState | null>;
+
+      // 从原文件复制知识文档或 Skill 到当前工作区的托管目录。
+      addWorkspaceResource(kind: "source" | "skill"): Promise<CraftWorkspaceResource[]>;
 
       // 切换到指定工作区，并取得该工作区的初始数据。
       selectWorkspace(workspaceId: string): Promise<CraftWorkspaceState>;

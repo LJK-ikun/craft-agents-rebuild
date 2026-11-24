@@ -1,6 +1,6 @@
 // 把项目文件夹登记成 Workspace，并为它准备独立的会话、Sources 和 Skills 目录。把项目文件夹登记成 Workspace，并为它准备独立的会话、Sources 和 Skills 目录。
 // 文件操作：创建目录、读取文件和保存文件。
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 
 // 路径工具：根据当前操作系统规则拼接和规范化路径。
 import path from "node:path";
@@ -15,6 +15,15 @@ export type WorkspaceRecord = {
   rootPath: string;           // 应用管理工作区资料的目录。
   workingDirectory: string;   // Agent 实际工作的项目目录。
   createdAt: string;           // 工作区创建时间。
+};
+
+export type WorkspaceResourceKind = "source" | "skill";
+
+export type WorkspaceResource = {
+  name: string;
+  kind: WorkspaceResourceKind;
+  size: number;
+  updatedAt: string;
 };
 
 // 负责工作区列表和单个工作区目录的读写。
@@ -99,6 +108,92 @@ export class WorkspaceStore {
     await this.save([workspace, ...workspaces]);
 
     return workspace;
+  }
+
+  // 列出工作区中已导入的 Sources 文档或 Skills Markdown 文件。
+  async listResources(
+    workspaceId: string,
+    kind: WorkspaceResourceKind,
+  ): Promise<WorkspaceResource[]> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const resourceDirectory = this.resourceDirectory(workspace, kind);
+    await mkdir(resourceDirectory, { recursive: true });
+
+    const entries = await readdir(resourceDirectory, { withFileTypes: true });
+    const resources: WorkspaceResource[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const extension = path.extname(entry.name).toLowerCase();
+      if (kind === "skill" && extension !== ".md") continue;
+      if (kind === "source" && extension !== ".md" && extension !== ".txt") continue;
+      const fileInfo = await stat(path.join(resourceDirectory, entry.name));
+      resources.push({
+        name: entry.name,
+        kind,
+        size: fileInfo.size,
+        updatedAt: fileInfo.mtime.toISOString(),
+      });
+    }
+    return resources.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  // 把用户选中的知识文件或 Skill 复制到 Craft 管理的工作区资源目录。
+  async addResource(
+    workspaceId: string,
+    kind: WorkspaceResourceKind,
+    sourcePath: string,
+  ): Promise<WorkspaceResource> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const normalizedSource = path.resolve(sourcePath);
+    const sourceInfo = await stat(normalizedSource);
+    if (!sourceInfo.isFile()) throw new Error("只能导入文件。");
+
+    const extension = path.extname(normalizedSource).toLowerCase();
+    const allowedExtensions = kind === "skill" ? [".md"] : [".md", ".txt"];
+    if (!allowedExtensions.includes(extension)) {
+      throw new Error(kind === "skill" ? "Skill 只支持 Markdown 文件。" : "知识文件只支持 Markdown 或 TXT。");
+    }
+
+    const resourceDirectory = this.resourceDirectory(workspace, kind);
+    await mkdir(resourceDirectory, { recursive: true });
+    const targetPath = await this.uniqueResourcePath(resourceDirectory, path.basename(normalizedSource));
+    await copyFile(normalizedSource, targetPath);
+    const savedInfo = await stat(targetPath);
+    return {
+      name: path.basename(targetPath),
+      kind,
+      size: savedInfo.size,
+      updatedAt: savedInfo.mtime.toISOString(),
+    };
+  }
+
+  private async getWorkspace(workspaceId: string): Promise<WorkspaceRecord> {
+    const workspaces = await this.list();
+    const workspace = workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) throw new Error("找不到指定工作区。");
+    return workspace;
+  }
+
+  private resourceDirectory(workspace: WorkspaceRecord, kind: WorkspaceResourceKind): string {
+    return path.join(workspace.rootPath, kind === "source" ? "sources" : "skills");
+  }
+
+  // 同名文件不覆盖旧内容，自动追加序号保留两份导入文件。
+  private async uniqueResourcePath(directory: string, fileName: string): Promise<string> {
+    const extension = path.extname(fileName);
+    const baseName = path.basename(fileName, extension);
+    let candidate = path.join(directory, fileName);
+    let suffix = 2;
+    while (true) {
+      try {
+        await stat(candidate);
+        candidate = path.join(directory, baseName + "-" + suffix + extension);
+        suffix += 1;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return candidate;
+        throw error;
+      }
+    }
   }
 
   // 将工作区列表写入 index.json。
