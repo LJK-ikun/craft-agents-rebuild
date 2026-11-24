@@ -1,5 +1,12 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
 import type { AgentEvent } from "./types.ts";
+import { CraftRpcClient } from "./transport/rpc-client.ts";
+import type { RpcBootstrap } from "./transport/rpc-types.ts";
+
+// 启动时用一次同步 IPC 获取本地 WebSocket 地址和令牌；业务请求随后走 RPC。
+const rpcBootstrap = ipcRenderer.sendSync("rpc:bootstrap") as RpcBootstrap | null;
+if (!rpcBootstrap) throw new Error("主进程尚未启动 RPC 服务。");
+const rpcClient = new CraftRpcClient(rpcBootstrap);
 
 // 目前先暴露一个只读的应用信息示例；后续再逐个增加安全 IPC 能力。
 contextBridge.exposeInMainWorld("craftAgent", {
@@ -33,8 +40,8 @@ contextBridge.exposeInMainWorld("craftAgent", {
   Array<{ role: "user" | "assistant"; content: string }>
   > => ipcRenderer.invoke("session:history"),
 
-  // 获取所有会话的标题和时间，用于显示会话列表。
-  listSessions: () => ipcRenderer.invoke("session:list"),
+  // 会话列表通过 WebSocket-RPC 请求后端；其他尚未迁移的功能仍使用 IPC。
+  listSessions: () => rpcClient.invoke("session:list"),
 
   // 创建新会话，并返回新会话信息和空消息列表。
   createSession: () => ipcRenderer.invoke("session:create"),

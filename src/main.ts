@@ -10,6 +10,8 @@ import {
 } from "./jsonl-store.ts";
 
 import { WorkspaceStore } from "./workspace-store.ts";
+import { CraftRpcServer } from "./transport/rpc-server.ts";
+import type { RpcBootstrap } from "./transport/rpc-types.ts";
 import type { AgentProvider, BackendConfig } from "./types.ts";
 
 // 从 Electron 导入应用生命周期、窗口、目录选择框和 IPC 注册工具。
@@ -30,6 +32,14 @@ const systemPrompt = "你是一个简洁、准确的中文助手。";
 
 // 管理所有 Workspace 的注册信息。
 let workspaceStore!: WorkspaceStore;
+// 本地 WebSocket-RPC 服务由 Electron 主进程承载，Preload 只拿到连接信息。
+let rpcServer: CraftRpcServer | null = null;
+let rpcBootstrap: RpcBootstrap | null = null;
+
+// Preload 只通过这个启动频道获取 RPC 地址和令牌，不开放任意 IPC 调用能力。
+ipcMain.on("rpc:bootstrap", (event) => {
+  event.returnValue = rpcBootstrap;
+});
 
 // 记录当前选中的 Workspace ID。
 let activeWorkspaceId: string | null = null;
@@ -130,13 +140,6 @@ async function activateWorkspace(workspaceId: string) {
     toolActivities,
   };
 }
-
-// 界面请求会话列表，主进程从存储层读取并返回
-ipcMain.handle("session:list", async () => {
-  if (!sessionStore) throw new Error("会话存储尚未初始化。");
-  return sessionStore.listSessions();
-});
-
 
 // 界面请求新建会话时，主进程创建记录并切换到这个空会话。
 ipcMain.handle("session:create", async () => {
@@ -344,6 +347,14 @@ async function createMainWindow(): Promise<void> {
     await activateWorkspace(workspaces[0].id);
   }
 
+  // 建立第一条 WebSocket-RPC 业务频道：Renderer 可通过它读取会话列表。
+  rpcServer = new CraftRpcServer();
+  rpcServer.handle("session:list", async () => {
+    if (!sessionStore) throw new Error("会话存储尚未初始化。");
+    return sessionStore.listSessions();
+  });
+  rpcBootstrap = await rpcServer.listen();
+
   const window = new BrowserWindow({
     width: 1100,
     height: 760,
@@ -386,8 +397,9 @@ app.on("before-quit", (event) => {
   agent = null;
 
   const disposePromise = agentToDispose?.dispose() ?? Promise.resolve();
-  void disposePromise.catch((error: unknown) => {
-    console.error("Failed to dispose the active agent:", error);
+  const closeRpcPromise = rpcServer?.close() ?? Promise.resolve();
+  void Promise.all([disposePromise, closeRpcPromise]).catch((error: unknown) => {
+    console.error("Failed to shut down the application cleanly:", error);
   }).finally(() => {
     app.quit();
   });
