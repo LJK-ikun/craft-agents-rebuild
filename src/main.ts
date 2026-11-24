@@ -35,10 +35,26 @@ let workspaceStore!: WorkspaceStore;
 // 本地 WebSocket-RPC 服务由 Electron 主进程承载，Preload 只拿到连接信息。
 let rpcServer: CraftRpcServer | null = null;
 let rpcBootstrap: RpcBootstrap | null = null;
+const rpcClientIds = new Map<number, string>();
+const clientCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // Preload 只通过这个启动频道获取 RPC 地址和令牌，不开放任意 IPC 调用能力。
 ipcMain.on("rpc:bootstrap", (event) => {
-  event.returnValue = rpcBootstrap;
+  if (!rpcBootstrap) {
+    event.returnValue = null;
+    return;
+  }
+
+  const webContentsId = event.sender.id;
+  let clientId = rpcClientIds.get(webContentsId);
+  if (!clientId) {
+    clientId = randomUUID();
+    rpcClientIds.set(webContentsId, clientId);
+    event.sender.once("destroyed", () => rpcClientIds.delete(webContentsId));
+  }
+
+  // 同一个窗口重载后仍取得同一 clientId，服务端才能恢复它的工作区和会话状态。
+  event.returnValue = { ...rpcBootstrap, clientId };
 });
 
 // 每个 WebSocket 客户端拥有独立的当前工作区、会话和 Agent 运行状态。
@@ -348,9 +364,19 @@ async function initializeApplication(): Promise<void> {
   rpcServer = new CraftRpcServer();
   registerRpcHandlers(rpcServer);
   rpcServer.onClientDisconnected((clientId) => {
-    void disposeClientRuntime(clientId).catch((error: unknown) => {
-      console.error("Failed to dispose disconnected RPC client:", error);
-    });
+    // 短暂断线先保留状态，给客户端自动重连机会；超时后再清理 Agent。
+    const timer = setTimeout(() => {
+      clientCleanupTimers.delete(clientId);
+      void disposeClientRuntime(clientId).catch((error: unknown) => {
+        console.error("Failed to dispose disconnected RPC client:", error);
+      });
+    }, 30_000);
+    clientCleanupTimers.set(clientId, timer);
+  });
+  rpcServer.onClientConnected((clientId) => {
+    const timer = clientCleanupTimers.get(clientId);
+    if (timer) clearTimeout(timer);
+    clientCleanupTimers.delete(clientId);
   });
   rpcBootstrap = await rpcServer.listen();
 
@@ -393,6 +419,8 @@ app.on("before-quit", (event) => {
   event.preventDefault();
 
   const disposePromises = [...clientRuntimes.keys()].map(disposeClientRuntime);
+  for (const timer of clientCleanupTimers.values()) clearTimeout(timer);
+  clientCleanupTimers.clear();
   const closeRpcPromise = rpcServer?.close() ?? Promise.resolve();
   void Promise.all([...disposePromises, closeRpcPromise]).catch((error: unknown) => {
     console.error("Failed to shut down the application cleanly:", error);

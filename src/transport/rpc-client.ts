@@ -11,42 +11,30 @@ type PendingRequest = {
 // 一个事件频道可以有多个界面订阅者。
 type RpcEventListener = (...args: unknown[]) => void;
 
-/** Preload 使用的客户端；Renderer 只拿到受控 API，不会接触 WebSocket。 */
+/** Preload 使用的客户端；负责握手、断线重连和请求/事件分发。 */
 export class CraftRpcClient {
-  private readonly socket: WebSocket;
+  private readonly clientId: string;
+  private socket: WebSocket | null = null;
+  private connection: Promise<void> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private disconnectFailureTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly listeners = new Map<string, Set<RpcEventListener>>();
-  private readonly connected: Promise<void>;
-  private resolveConnected!: () => void;
-  private rejectConnected!: (error: Error) => void;
 
-  constructor(bootstrap: RpcBootstrap) {
-    this.socket = new WebSocket(bootstrap.url);
-    this.connected = new Promise<void>((resolve, reject) => {
-      this.resolveConnected = resolve;
-      this.rejectConnected = reject;
-    });
-    // 尚未有 UI 请求时，也要处理连接失败，避免未处理的 Promise 警告。
-    void this.connected.catch(() => undefined);
-
-    this.socket.onopen = () => {
-      // WebSocket 打开只说明网络连上了；握手成功后才算应用连接就绪。
-      this.socket.send(JSON.stringify({
-        type: "handshake",
-        id: randomUUID(),
-        token: bootstrap.token,
-        protocolVersion: 1,
-      } satisfies RpcMessage));
-    };
-
-    this.socket.onmessage = (event) => this.handleMessage(String(event.data));
-    this.socket.onerror = () => this.failAll(new Error("无法连接 Craft RPC 服务。"));
-    this.socket.onclose = () => this.failAll(new Error("Craft RPC 连接已关闭。"));
+  constructor(private readonly bootstrap: RpcBootstrap) {
+    this.clientId = bootstrap.clientId ?? randomUUID();
+    // 页面刚启动时就建立连接；若失败会自动按退避间隔重试。
+    void this.ensureConnected().catch(() => undefined);
   }
 
-  /** 调用一个已注册的业务频道，并等待它对应的响应。 */
+  /** 调用业务频道；连接断开时当前请求失败，但不会悄悄重复执行它。 */
   async invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
-    await this.connected;
+    await this.ensureConnected();
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Craft RPC 尚未连接，请稍后重试。");
+    }
 
     const id = randomUUID();
     return await new Promise<T>((resolve, reject) => {
@@ -64,12 +52,7 @@ export class CraftRpcClient {
       });
 
       try {
-        this.socket.send(JSON.stringify({
-          id,
-          type: "request",
-          channel,
-          args,
-        } satisfies RpcMessage));
+        socket.send(JSON.stringify({ id, type: "request", channel, args } satisfies RpcMessage));
       } catch (error) {
         clearTimeout(timeout);
         this.pending.delete(id);
@@ -93,24 +76,100 @@ export class CraftRpcClient {
     };
   }
 
-  /** 按响应 id 找到原请求，并完成对应 Promise。 */
-  private handleMessage(raw: string): void {
+  /** 复用进行中的连接；没有可用连接时创建一个并等待握手确认。 */
+  private ensureConnected(): Promise<void> {
+    if (this.connection) return this.connection;
+
+    const socket = new WebSocket(this.bootstrap.url);
+    const handshakeId = randomUUID();
+    this.socket = socket;
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    this.connection = ready;
+    let settled = false;
+
+    socket.onopen = () => {
+      try {
+        socket.send(JSON.stringify({
+          type: "handshake",
+          id: handshakeId,
+          clientId: this.clientId,
+          token: this.bootstrap.token,
+          protocolVersion: 1,
+        } satisfies RpcMessage));
+      } catch (error) {
+        if (!settled) {
+          settled = true;
+          rejectReady(error instanceof Error ? error : new Error(String(error)));
+        }
+        socket.close();
+      }
+    };
+
+    socket.onmessage = (event) => {
+      this.handleMessage(socket, String(event.data), () => {
+        if (settled) return;
+        settled = true;
+        this.reconnectAttempt = 0;
+        if (this.disconnectFailureTimer) clearTimeout(this.disconnectFailureTimer);
+        this.disconnectFailureTimer = null;
+        resolveReady();
+      }, handshakeId);
+    };
+
+    socket.onerror = () => {
+      if (!settled) {
+        settled = true;
+        rejectReady(new Error("无法连接 Craft RPC 服务。"));
+      }
+    };
+
+    socket.onclose = () => {
+      if (!settled) {
+        settled = true;
+        rejectReady(new Error("Craft RPC 连接已关闭。"));
+      }
+      if (this.socket === socket) this.socket = null;
+      if (this.connection === ready) this.connection = null;
+      if (this.disconnectFailureTimer) clearTimeout(this.disconnectFailureTimer);
+      this.disconnectFailureTimer = setTimeout(() => {
+        this.disconnectFailureTimer = null;
+        this.failPending(new Error("Craft RPC 重连失败；未完成的请求没有自动重发。"));
+      }, 15_000);
+      this.scheduleReconnect();
+    };
+
+    // 构造时可能还没有任何 UI 请求等待连接，主动处理拒绝避免未处理 Promise。
+    void this.connection.catch(() => undefined);
+    return this.connection;
+  }
+
+  /** 按响应 ID 完成请求，或把服务端事件分发给对应订阅者。 */
+  private handleMessage(socket: WebSocket, raw: string, onHandshakeAck: () => void, handshakeId: string): void {
     let message: RpcMessage;
     try {
       message = JSON.parse(raw) as RpcMessage;
     } catch {
-      this.failAll(new Error("RPC 服务返回了无效 JSON。"));
+      socket.close(4002, "RPC 服务返回了无效 JSON");
       return;
     }
 
     if (message.type === "handshake_ack") {
-      this.resolveConnected();
+      if (message.id === handshakeId) onHandshakeAck();
       return;
     }
 
     if (message.type === "event") {
       for (const listener of this.listeners.get(message.channel) ?? []) {
-        listener(...message.args);
+        try {
+          listener(...message.args);
+        } catch (error) {
+          console.error("RPC event listener failed:", error);
+        }
       }
       return;
     }
@@ -118,20 +177,26 @@ export class CraftRpcClient {
     if (message.type !== "response" && message.type !== "error") return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
-
     clearTimeout(pending.timeout);
     this.pending.delete(message.id);
 
-    if (message.type === "error") {
-      pending.reject(new Error(message.error.message));
-    } else {
-      pending.resolve(message.result);
-    }
+    if (message.type === "error") pending.reject(new Error(message.error.message));
+    else pending.resolve(message.result);
   }
 
-  /** 连接断开时拒绝所有未完成请求，避免界面一直等待。 */
-  private failAll(error: Error): void {
-    this.rejectConnected(error);
+  /** 连接恢复后重试握手；指数退避避免故障时频繁冲击服务端。 */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    const delay = Math.min(500 * 2 ** this.reconnectAttempt, 8_000);
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.ensureConnected().catch(() => undefined);
+    }, delay);
+  }
+
+  /** 断线时拒绝全部未完成请求，防止界面无限等待或误以为请求成功。 */
+  private failPending(error: Error): void {
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timeout);
       pending.reject(error);

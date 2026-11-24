@@ -18,6 +18,7 @@ export class CraftRpcServer {
   // 只保留已完成令牌握手的客户端，供服务端向指定界面推送事件。
   private readonly clients = new Map<string, WebSocket>();
   private readonly disconnectListeners = new Set<(clientId: string) => void>();
+  private readonly connectListeners = new Set<(clientId: string) => void>();
 
   constructor() {
     this.listening = new Promise<void>((resolve, reject) => {
@@ -39,6 +40,12 @@ export class CraftRpcServer {
   onClientDisconnected(listener: (clientId: string) => void): () => void {
     this.disconnectListeners.add(listener);
     return () => this.disconnectListeners.delete(listener);
+  }
+
+  /** 注册客户端连接回调，用于取消断线后的资源回收计时。 */
+  onClientConnected(listener: (clientId: string) => void): () => void {
+    this.connectListeners.add(listener);
+    return () => this.connectListeners.delete(listener);
   }
 
   /** 启动本地 WebSocket 服务，并返回给 Preload 使用的连接资料。 */
@@ -70,7 +77,7 @@ export class CraftRpcServer {
 
   /** 处理一个新连接：先验令牌，再允许它发送 RPC 请求。 */
   private accept(socket: WebSocket): void {
-    const clientId = randomUUID();
+    let clientId: string = randomUUID();
     let authenticated = false;
 
     const handshakeTimer = setTimeout(() => {
@@ -80,14 +87,21 @@ export class CraftRpcServer {
 
     socket.on("close", () => {
       clearTimeout(handshakeTimer);
-      this.clients.delete(clientId);
-      for (const listener of this.disconnectListeners) listener(clientId);
+      // 相同 Renderer 快速重连时，旧 socket 不能清掉新 socket 的客户端映射。
+      if (this.clients.get(clientId) === socket) {
+        this.clients.delete(clientId);
+        for (const listener of this.disconnectListeners) listener(clientId);
+      }
     });
     socket.on("message", (raw) => {
-      void this.handleMessage(socket, clientId, raw.toString(), () => authenticated, () => {
+      void this.handleMessage(socket, () => clientId, raw.toString(), () => authenticated, (requestedClientId) => {
+        const previousSocket = this.clients.get(requestedClientId);
+        clientId = requestedClientId;
         authenticated = true;
         this.clients.set(clientId, socket);
         clearTimeout(handshakeTimer);
+        if (previousSocket && previousSocket !== socket) previousSocket.close(4004, "客户端已重连");
+        for (const listener of this.connectListeners) listener(clientId);
       });
     });
   }
@@ -95,10 +109,10 @@ export class CraftRpcServer {
   /** 验证消息类型、执行频道处理函数，并把结果回给原请求。 */
   private async handleMessage(
     socket: WebSocket,
-    clientId: string,
+    getClientId: () => string,
     raw: string,
     isAuthenticated: () => boolean,
-    onAuthenticated: () => void,
+    onAuthenticated: (clientId: string) => void,
   ): Promise<void> {
     let message: RpcMessage;
     try {
@@ -109,12 +123,16 @@ export class CraftRpcServer {
     }
 
     if (message.type === "handshake") {
-      if (message.protocolVersion !== 1 || message.token !== this.token) {
+      if (
+        message.protocolVersion !== 1 ||
+        message.token !== this.token ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(message.clientId)
+      ) {
         socket.close(4001, "RPC 握手验证失败");
         return;
       }
 
-      onAuthenticated();
+      onAuthenticated(message.clientId);
       this.send(socket, {
         type: "handshake_ack",
         id: message.id,
@@ -142,10 +160,12 @@ export class CraftRpcServer {
     }
 
     try {
-      const result = await handler({ clientId }, ...message.args);
-      this.send(socket, { type: "response", id: message.id, result });
+      const result = await handler({ clientId: getClientId() }, ...message.args);
+      const responseSocket = this.clients.get(getClientId()) ?? socket;
+      this.send(responseSocket, { type: "response", id: message.id, result });
     } catch (error) {
-      this.send(socket, {
+      const responseSocket = this.clients.get(getClientId()) ?? socket;
+      this.send(responseSocket, {
         type: "error",
         id: message.id,
         error: { message: error instanceof Error ? error.message : String(error) },
