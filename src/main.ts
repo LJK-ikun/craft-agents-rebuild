@@ -41,24 +41,49 @@ ipcMain.on("rpc:bootstrap", (event) => {
   event.returnValue = rpcBootstrap;
 });
 
-// 记录当前选中的 Workspace ID。
-let activeWorkspaceId: string | null = null;
-// 保存当前项目目录，供当前工作区创建模型后端时使用。
-let activeWorkingDirectory: string | null = null;
-// Agent、存储对象和当前会话 ID 都由主进程管理。
-let agent: Agent | null = null;
-let sessionStore: JsonlSessionStore | null = null;
-let activeSessionId: string | null = null;
-// 一个窗口一次只运行一个请求；取消操作必须发回启动该请求的 Agent。
-let activeAsk: { id: string; agent: Agent; clientId: string } | null = null;
-// 每个确认请求记录发起它的 Agent 和窗口，避免其他客户端代为批准。
+// 每个 WebSocket 客户端拥有独立的当前工作区、会话和 Agent 运行状态。
+type ClientRuntime = {
+  activeWorkspaceId: string | null;
+  activeWorkingDirectory: string | null;
+  agent: Agent | null;
+  sessionStore: JsonlSessionStore | null;
+  activeSessionId: string | null;
+  activeAsk: { id: string; agent: Agent } | null;
+};
+
+const clientRuntimes = new Map<string, ClientRuntime>();
+// 每个确认请求记录发起它的 Agent 和客户端，避免其他客户端代为批准。
 const permissionOwners = new Map<string, { agent: Agent; clientId: string }>();
+
+function getClientRuntime(clientId: string): ClientRuntime {
+  let runtime = clientRuntimes.get(clientId);
+  if (!runtime) {
+    runtime = {
+      activeWorkspaceId: null,
+      activeWorkingDirectory: null,
+      agent: null,
+      sessionStore: null,
+      activeSessionId: null,
+      activeAsk: null,
+    };
+    clientRuntimes.set(clientId, runtime);
+  }
+  return runtime;
+}
 
 function clearPermissionsForAgent(target: Agent | null): void {
   if (!target) return;
   for (const [requestId, owner] of permissionOwners) {
     if (owner.agent === target) permissionOwners.delete(requestId);
   }
+}
+
+async function disposeClientRuntime(clientId: string): Promise<void> {
+  const runtime = clientRuntimes.get(clientId);
+  if (!runtime) return;
+  clearPermissionsForAgent(runtime.agent);
+  clientRuntimes.delete(clientId);
+  await runtime.agent?.dispose();
 }
 
 // 为一个应用会话创建 Agent，并把 Pi SDK 数据隔离到该会话的目录。
@@ -94,7 +119,7 @@ function createAgent(
 }
 
 // 切换到指定工作区，并加载它自己的会话和聊天历史。
-async function activateWorkspace(workspaceId: string) {
+async function activateWorkspace(workspaceId: string, runtime: ClientRuntime) {
   // 从工作区列表里找到目标工作区。
   const workspaces = await workspaceStore.list();
   const workspace = workspaces.find((item) => item.id === workspaceId);
@@ -118,13 +143,13 @@ async function activateWorkspace(workspaceId: string) {
   const toolActivities = await nextSessionStore.loadToolActivities(sessionId);
 
   // 确认数据读取成功后，再把当前状态切换到目标工作区。
-  clearPermissionsForAgent(agent);
-  await agent?.dispose();
-  activeWorkspaceId = workspace.id;
-  activeWorkingDirectory = workspace.workingDirectory;
-  activeSessionId = sessionId;
-  sessionStore = nextSessionStore;
-  agent = createAgent(
+  clearPermissionsForAgent(runtime.agent);
+  await runtime.agent?.dispose();
+  runtime.activeWorkspaceId = workspace.id;
+  runtime.activeWorkingDirectory = workspace.workingDirectory;
+  runtime.activeSessionId = sessionId;
+  runtime.sessionStore = nextSessionStore;
+  runtime.agent = createAgent(
     activeSession,
     workspace.workingDirectory,
     nextSessionStore,
@@ -143,202 +168,143 @@ async function activateWorkspace(workspaceId: string) {
 
 // 把应用业务能力注册到 WebSocket-RPC；Renderer 只能调用这里明确开放的频道。
 function registerRpcHandlers(server: CraftRpcServer): void {
-  server.handle("session:list", async () => {
-    if (!sessionStore) throw new Error("会话存储尚未初始化。");
-    return sessionStore.listSessions();
+  // 读取本客户端当前工作区中的会话列表，不会读到别的客户端选择状态。
+  server.handle("session:list", async (context) => {
+    const store = getClientRuntime(context.clientId).sessionStore;
+    if (!store) throw new Error("请先选择工作区。");
+    return store.listSessions();
   });
 
-  server.handle("session:create", async () => {
-  if (!sessionStore) throw new Error("会话存储尚未初始化。");
-  if (!activeWorkingDirectory) throw new Error("当前工作区尚未初始化。");
-
-  // 在索引里创建会话记录，并取得新会话的唯一 ID。
-  const session = await sessionStore.createSession();
-
-  // 关闭旧会话的模型进程，避免切换后仍留在后台。
-  clearPermissionsForAgent(agent);
-  await agent?.dispose();
-
-  // 更新当前会话 ID，后续发送的问题就会保存到这个会话。
-  activeSessionId = session.id;
-
-  // 新会话没有历史消息，因此创建一个空历史的 Agent。
-  agent = createAgent(session, activeWorkingDirectory, sessionStore, []);
-
-  // 把新会话资料和空消息列表交还给界面。
-  return { session, messages: [] };
-  });
-
-// 界面选择会话时，主进程读取该会话历史并重建 Agent
-  server.handle("session:select", async (_context, sessionId: unknown) => {
-  if (!sessionStore) throw new Error("会话存储尚未初始化")
-  if (typeof sessionId !== "string") {
-    throw new Error("会话 ID 无效")
-  }
-
-  const messages = await sessionStore.loadMessages(sessionId)
-  const toolActivities = await sessionStore.loadToolActivities(sessionId);
-  const sessions = await sessionStore.listSessions();
-  const selectedSession = sessions.find((session) => session.id === sessionId);
-  if (!selectedSession) throw new Error("找不到指定会话。");
-  if (!activeWorkingDirectory) throw new Error("当前工作区尚未初始化。");
-
-  // 关闭旧会话的模型进程，再创建所选会话的 Agent。
-  clearPermissionsForAgent(agent);
-  await agent?.dispose();
-
-  // 成功读到目标绘画后，再更新当前会话状态
-  activeSessionId = sessionId;
-  agent = createAgent(
-    selectedSession,
-    activeWorkingDirectory,
-    sessionStore,
-    messages,
-  )
-
-  return { messages, toolActivities }
-  });
-// 返回所有已登记的工作区，供界面显示工作区列表。
-  server.handle("workspace:list", async () => {
-  return workspaceStore.list();
-  });
-
-// 弹出目录选择框，把用户选中的项目文件夹登记成工作区。
-  server.handle("workspace:add", async () => {
-  const result = await dialog.showOpenDialog({
-    title: "选择项目文件夹",
-    properties: ["openDirectory"],
-  });
-
-  // 用户取消选择时，不创建工作区。
-  if (result.canceled || !result.filePaths[0]) {
-    return null;
-  }
-
-  // 保存工作区后立即切换过去。
-  const workspace = await workspaceStore.addWorkspace(result.filePaths[0]);
-  return activateWorkspace(workspace.id);
-  });
-
-// 切换到界面指定的工作区。
-  server.handle("workspace:select", async (_context, workspaceId: unknown) => {
-  if (typeof workspaceId !== "string") {
-    throw new Error("工作区 ID 无效。");
-  }
-
-  return activateWorkspace(workspaceId);
-  });
-// 界面读取当前会话历史时，只返回当前 ID 对应的消息
-  server.handle("session:history", async () => {
-  if (!sessionStore) throw new Error("会话存储尚未初始化。");
-  if (!activeSessionId) throw new Error("当前没有选中的会话。");
-
-  return sessionStore.loadMessages(activeSessionId);
-  });
-
-// 只有当前确实发出过该权限请求的 Agent，才能收到界面的批准结果。
-  server.handle("agent:permission-response", (context, requestId: unknown, approved: unknown) => {
-  if (typeof requestId !== "string" || typeof approved !== "boolean") {
-    throw new Error("工具权限响应无效。");
-  }
-  const owner = permissionOwners.get(requestId);
-  if (!owner) throw new Error("该工具请求已失效或已经处理。");
-  if (owner.clientId !== context.clientId) throw new Error("无权响应其他窗口的工具请求。");
-
-  permissionOwners.delete(requestId);
-  owner.agent.respondToPermission(requestId, approved);
-});
-
-// 保存当前会话的权限模式，并立即同步给当前运行中的 Pi Agent。
-  server.handle("session:set-permission-mode", async (_context, mode: unknown) => {
-  if (mode !== "explore" && mode !== "ask" && mode !== "execute") {
-    throw new Error("权限模式无效。");
-  }
-  if (!sessionStore || !activeSessionId) throw new Error("当前没有活动会话。");
-
-  await sessionStore.savePermissionMode(activeSessionId, mode);
-  agent?.setPermissionMode(mode);
-  return mode;
-  });
-
-// 界面停止按钮只请求中止当前运行，不会关闭会话或清除已有历史。
-  server.handle("agent:cancel", async (context) => {
-  const runningAsk = activeAsk?.clientId === context.clientId ? activeAsk : null;
-  if (!runningAsk) return false;
-
-  await runningAsk.agent.cancel();
-  return true;
-  });
-
-// 界面发送问题时，调用当前会话的 Agent，并把问答保存到当前会话。
-  server.handle("agent:ask", async (context, userText: unknown): Promise<string> => {
-  if (typeof userText !== "string" || !userText.trim()) {
-    throw new Error("请输入有效的问题。");
-  }
-  if (!sessionStore) throw new Error("会话存储尚未初始化。");
-  if (!agent) {
-    throw new Error(
-      "请设置 PI_API_KEY（或 ANTHROPIC_API_KEY）；可选设置 PI_AUTH_PROVIDER 和 PI_MODEL。",
-    );
-  }
-  if (!activeSessionId) throw new Error("当前没有选中的会话。");
-  if (activeAsk) throw new Error("当前已有一条 Agent 请求正在运行。");
-
-  // 先保存本次使用的对象和 ID，避免请求等待期间切换会话后存错地方。
-  const currentAgent = agent;
-  const currentSessionStore = sessionStore;
-  const sessionId = activeSessionId;
-  const question = userText.trim();
-  const askId = randomUUID();
-  activeAsk = { id: askId, agent: currentAgent, clientId: context.clientId };
-
-  const answerParts: string[] = [];
-
-  // 一边读取后端事件，一边发给 Renderer；同时收集文本用于历史存储。
-  try {
-    for await (const agentEvent of currentAgent.chat(question)) {
-      if (agentEvent.type === "permission_request") {
-        permissionOwners.set(agentEvent.requestId, { agent: currentAgent, clientId: context.clientId });
-      }
-      if (agentEvent.type === "cancelled") {
-        clearPermissionsForAgent(currentAgent);
-      }
-      server.pushToClient(context.clientId, "agent:event", agentEvent);
-
-      // 持久化工具轨迹；若日志写入失败，记录错误但不中断模型本轮执行。
-      if (agentEvent.type === "tool_start" || agentEvent.type === "tool_result") {
-        try {
-          await currentSessionStore.appendToolEvent(sessionId, agentEvent);
-        } catch (error) {
-          console.error("Failed to persist tool event:", error);
-        }
-      }
-
-      if (agentEvent.type === "text_delta") {
-        answerParts.push(agentEvent.text);
-      }
-
-      if (agentEvent.type === "error") {
-        throw new Error(agentEvent.message);
-      }
+  // 创建会话时只替换当前客户端的 Agent，不影响其他窗口正在使用的 Agent。
+  server.handle("session:create", async (context) => {
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.sessionStore || !runtime.activeWorkingDirectory) {
+      throw new Error("请先选择工作区。");
     }
-  } finally {
-    if (activeAsk?.id === askId) activeAsk = null;
-  }
-
-  const answer = answerParts.join("");
-
-  // 两条消息都写入刚才发起请求的那个会话。
-  await currentSessionStore.appendMessage(sessionId, {
-    role: "user",
-    content: question,
-  });
-  await currentSessionStore.appendMessage(sessionId, {
-    role: "assistant",
-    content: answer,
+    const session = await runtime.sessionStore.createSession();
+    clearPermissionsForAgent(runtime.agent);
+    await runtime.agent?.dispose();
+    runtime.activeSessionId = session.id;
+    runtime.agent = createAgent(session, runtime.activeWorkingDirectory, runtime.sessionStore, []);
+    return { session, messages: [] };
   });
 
-  return answer;
+  // 会话切换会读取对应历史，并为当前客户端重建 Agent。
+  server.handle("session:select", async (context, sessionId: unknown) => {
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.sessionStore || !runtime.activeWorkingDirectory) throw new Error("请先选择工作区。");
+    if (typeof sessionId !== "string") throw new Error("会话 ID 无效。");
+
+    const sessions = await runtime.sessionStore.listSessions();
+    const session = sessions.find((item) => item.id === sessionId);
+    if (!session) throw new Error("找不到指定会话。");
+    const messages = await runtime.sessionStore.loadMessages(sessionId);
+    const toolActivities = await runtime.sessionStore.loadToolActivities(sessionId);
+
+    clearPermissionsForAgent(runtime.agent);
+    await runtime.agent?.dispose();
+    runtime.activeSessionId = sessionId;
+    runtime.agent = createAgent(session, runtime.activeWorkingDirectory, runtime.sessionStore, messages);
+    return { messages, toolActivities };
+  });
+
+  server.handle("workspace:list", async () => workspaceStore.list());
+
+  // 工作区目录选择是 Electron 原生能力，因此 RPC 请求仍由主进程执行。
+  server.handle("workspace:add", async (context) => {
+    const result = await dialog.showOpenDialog({
+      title: "选择项目文件夹",
+      properties: ["openDirectory"],
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    const workspace = await workspaceStore.addWorkspace(result.filePaths[0]);
+    return activateWorkspace(workspace.id, getClientRuntime(context.clientId));
+  });
+
+  // 选择工作区后只更新发起该 RPC 请求的客户端状态。
+  server.handle("workspace:select", async (context, workspaceId: unknown) => {
+    if (typeof workspaceId !== "string") throw new Error("工作区 ID 无效。");
+    return activateWorkspace(workspaceId, getClientRuntime(context.clientId));
+  });
+
+  server.handle("session:history", async (context) => {
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.sessionStore || !runtime.activeSessionId) throw new Error("当前没有选中的会话。");
+    return runtime.sessionStore.loadMessages(runtime.activeSessionId);
+  });
+
+  // 工具批准必须由发起该工具请求的同一客户端提交。
+  server.handle("agent:permission-response", (context, requestId: unknown, approved: unknown) => {
+    if (typeof requestId !== "string" || typeof approved !== "boolean") throw new Error("工具权限响应无效。");
+    const owner = permissionOwners.get(requestId);
+    if (!owner) throw new Error("该工具请求已失效或已经处理。");
+    if (owner.clientId !== context.clientId) throw new Error("无权响应其他窗口的工具请求。");
+    permissionOwners.delete(requestId);
+    owner.agent.respondToPermission(requestId, approved);
+  });
+
+  // 权限模式保存在该客户端当前选中的会话，并同步给它的 Agent。
+  server.handle("session:set-permission-mode", async (context, mode: unknown) => {
+    if (mode !== "explore" && mode !== "ask" && mode !== "execute") throw new Error("权限模式无效。");
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.sessionStore || !runtime.activeSessionId) throw new Error("当前没有活动会话。");
+    await runtime.sessionStore.savePermissionMode(runtime.activeSessionId, mode);
+    runtime.agent?.setPermissionMode(mode);
+    return mode;
+  });
+
+  // 取消只作用于当前客户端自己的运行请求。
+  server.handle("agent:cancel", async (context) => {
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.activeAsk) return false;
+    await runtime.activeAsk.agent.cancel();
+    return true;
+  });
+
+  // 运行当前客户端 Agent；事件只推送回这条请求的来源连接。
+  server.handle("agent:ask", async (context, userText: unknown): Promise<string> => {
+    if (typeof userText !== "string" || !userText.trim()) throw new Error("请输入有效的问题。");
+    const runtime = getClientRuntime(context.clientId);
+    if (!runtime.sessionStore || !runtime.activeSessionId) throw new Error("请先选择工作区和会话。");
+    if (!runtime.agent) {
+      throw new Error("请设置 PI_API_KEY（或 ANTHROPIC_API_KEY）；可选设置 PI_AUTH_PROVIDER 和 PI_MODEL。");
+    }
+    if (runtime.activeAsk) throw new Error("当前客户端已有一条 Agent 请求正在运行。");
+
+    const currentAgent = runtime.agent;
+    const currentStore = runtime.sessionStore;
+    const sessionId = runtime.activeSessionId;
+    const askId = randomUUID();
+    const question = userText.trim();
+    runtime.activeAsk = { id: askId, agent: currentAgent };
+    const answerParts: string[] = [];
+
+    try {
+      for await (const event of currentAgent.chat(question)) {
+        if (event.type === "permission_request") {
+          permissionOwners.set(event.requestId, { agent: currentAgent, clientId: context.clientId });
+        }
+        if (event.type === "cancelled") clearPermissionsForAgent(currentAgent);
+        server.pushToClient(context.clientId, "agent:event", event);
+
+        if (event.type === "tool_start" || event.type === "tool_result") {
+          try {
+            await currentStore.appendToolEvent(sessionId, event);
+          } catch (error) {
+            console.error("Failed to persist tool event:", error);
+          }
+        }
+        if (event.type === "text_delta") answerParts.push(event.text);
+        if (event.type === "error") throw new Error(event.message);
+      }
+    } finally {
+      if (runtime.activeAsk?.id === askId) runtime.activeAsk = null;
+    }
+
+    const answer = answerParts.join("");
+    await currentStore.appendMessage(sessionId, { role: "user", content: question });
+    await currentStore.appendMessage(sessionId, { role: "assistant", content: answer });
+    return answer;
   });
 }
 
@@ -349,15 +315,14 @@ async function createMainWindow(): Promise<void> {
     path.join(app.getPath("userData"), "workspaces"),
   );
 
-  // 启动时恢复第一个工作区；没有工作区时由界面提示用户添加。
-  const workspaces = await workspaceStore.list();
-  if (workspaces[0]) {
-    await activateWorkspace(workspaces[0].id);
-  }
-
   // 建立 WebSocket-RPC 服务，并注册所有工作区、会话和 Agent 业务频道。
   rpcServer = new CraftRpcServer();
   registerRpcHandlers(rpcServer);
+  rpcServer.onClientDisconnected((clientId) => {
+    void disposeClientRuntime(clientId).catch((error: unknown) => {
+      console.error("Failed to dispose disconnected RPC client:", error);
+    });
+  });
   rpcBootstrap = await rpcServer.listen();
 
   const window = new BrowserWindow({
@@ -397,13 +362,9 @@ app.on("before-quit", (event) => {
   isQuitting = true;
   event.preventDefault();
 
-  const agentToDispose = agent;
-  clearPermissionsForAgent(agentToDispose);
-  agent = null;
-
-  const disposePromise = agentToDispose?.dispose() ?? Promise.resolve();
+  const disposePromises = [...clientRuntimes.keys()].map(disposeClientRuntime);
   const closeRpcPromise = rpcServer?.close() ?? Promise.resolve();
-  void Promise.all([disposePromise, closeRpcPromise]).catch((error: unknown) => {
+  void Promise.all([...disposePromises, closeRpcPromise]).catch((error: unknown) => {
     console.error("Failed to shut down the application cleanly:", error);
   }).finally(() => {
     app.quit();

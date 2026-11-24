@@ -17,6 +17,7 @@ export class CraftRpcServer {
   private readonly handlers = new Map<string, RpcHandler>();
   // 只保留已完成令牌握手的客户端，供服务端向指定界面推送事件。
   private readonly clients = new Map<string, WebSocket>();
+  private readonly disconnectListeners = new Set<(clientId: string) => void>();
 
   constructor() {
     this.listening = new Promise<void>((resolve, reject) => {
@@ -32,6 +33,12 @@ export class CraftRpcServer {
       throw new Error(`RPC 频道重复注册：${channel}`);
     }
     this.handlers.set(channel, handler);
+  }
+
+  /** 注册客户端断线回调，供主进程回收该客户端持有的 Agent 等资源。 */
+  onClientDisconnected(listener: (clientId: string) => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
   }
 
   /** 启动本地 WebSocket 服务，并返回给 Preload 使用的连接资料。 */
@@ -74,6 +81,7 @@ export class CraftRpcServer {
     socket.on("close", () => {
       clearTimeout(handshakeTimer);
       this.clients.delete(clientId);
+      for (const listener of this.disconnectListeners) listener(clientId);
     });
     socket.on("message", (raw) => {
       void this.handleMessage(socket, clientId, raw.toString(), () => authenticated, () => {
