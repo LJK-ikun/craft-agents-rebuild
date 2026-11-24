@@ -109,6 +109,19 @@ export function App() {
     });
   }, []);
 
+  // 服务端事件缓存过期时，重新加载当前工作区和会话，避免 UI 保留不完整状态。
+  useEffect(() => {
+    return window.craftAgent.onTransportStale(() => {
+      if (!activeWorkspaceId || !activeSessionId) return;
+      void window.craftAgent
+        .restoreWorkspaceState(activeWorkspaceId, activeSessionId)
+        .then(applyWorkspaceState)
+        .catch((cause) => {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        });
+    });
+  }, [activeWorkspaceId, activeSessionId]);
+
   // 用户明确选择允许或拒绝后，主进程会把决定送回 Pi 子进程。
   async function handlePermission(requestId: string, approved: boolean) {
     try {

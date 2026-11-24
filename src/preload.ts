@@ -29,6 +29,10 @@ contextBridge.exposeInMainWorld("craftAgent", {
     return rpcClient.on("agent:event", (...args) => callback(args[0] as AgentEvent));
   },
 
+  // 事件缓存已经过期时通知 Renderer；由界面重新读取当前工作区和会话。
+  onTransportStale: (callback: () => void): (() => void) =>
+    rpcClient.on("transport:stale", callback),
+
   // 通过 RPC 读取当前会话的历史消息。
   getHistory: (): Promise<
   Array<{ role: "user" | "assistant"; content: string }>
@@ -53,4 +57,8 @@ contextBridge.exposeInMainWorld("craftAgent", {
   // 切换工作区，并取得该工作区当前会话和聊天记录。
   selectWorkspace: (workspaceId: string) =>
     rpcClient.invoke("workspace:select", workspaceId),
+
+  // 服务端无法补齐事件时，根据 Renderer 记住的选择恢复界面状态。
+  restoreWorkspaceState: (workspaceId: string, sessionId: string) =>
+    rpcClient.invoke("workspace:restore", workspaceId, sessionId),
 })

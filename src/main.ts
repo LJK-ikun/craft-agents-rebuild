@@ -35,7 +35,6 @@ let workspaceStore!: WorkspaceStore;
 // 本地 WebSocket-RPC 服务由 Electron 主进程承载，Preload 只拿到连接信息。
 let rpcServer: CraftRpcServer | null = null;
 let rpcBootstrap: RpcBootstrap | null = null;
-const rpcClientIds = new Map<number, string>();
 const clientCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // Preload 只通过这个启动频道获取 RPC 地址和令牌，不开放任意 IPC 调用能力。
@@ -45,16 +44,8 @@ ipcMain.on("rpc:bootstrap", (event) => {
     return;
   }
 
-  const webContentsId = event.sender.id;
-  let clientId = rpcClientIds.get(webContentsId);
-  if (!clientId) {
-    clientId = randomUUID();
-    rpcClientIds.set(webContentsId, clientId);
-    event.sender.once("destroyed", () => rpcClientIds.delete(webContentsId));
-  }
-
-  // 同一个窗口重载后仍取得同一 clientId，服务端才能恢复它的工作区和会话状态。
-  event.returnValue = { ...rpcBootstrap, clientId };
+  // WebContents ID 用于服务端校验重连是否来自原窗口；clientId 由 RPC 服务端分配。
+  event.returnValue = { ...rpcBootstrap, webContentsId: event.sender.id };
 });
 
 // 每个 WebSocket 客户端拥有独立的当前工作区、会话和 Agent 运行状态。
@@ -137,7 +128,11 @@ function createAgent(
 }
 
 // 切换到指定工作区，并加载它自己的会话和聊天历史。
-async function activateWorkspace(workspaceId: string, runtime: ClientRuntime) {
+async function activateWorkspace(
+  workspaceId: string,
+  runtime: ClientRuntime,
+  preferredSessionId?: string,
+) {
   // 从工作区列表里找到目标工作区。
   const workspaces = await workspaceStore.list();
   const workspace = workspaces.find((item) => item.id === workspaceId);
@@ -153,7 +148,7 @@ async function activateWorkspace(workspaceId: string, runtime: ClientRuntime) {
 
   // 读取这个工作区的会话列表；首次使用时会创建默认会话。
   const sessions = await nextSessionStore.listSessions();
-  const activeSession = sessions[0];
+  const activeSession = sessions.find((session) => session.id === preferredSessionId) ?? sessions[0];
   const sessionId = activeSession.id;
 
   // 读取默认会话的消息，并用它们创建 Agent。
@@ -243,6 +238,14 @@ function registerRpcHandlers(server: CraftRpcServer): void {
   server.handle("workspace:select", async (context, workspaceId: unknown) => {
     if (typeof workspaceId !== "string") throw new Error("工作区 ID 无效。");
     return activateWorkspace(workspaceId, getClientRuntime(context.clientId));
+  });
+
+  // 事件缓存过期后，Renderer 把最近使用的工作区和会话传回来重新装载状态。
+  server.handle("workspace:restore", async (context, workspaceId: unknown, sessionId: unknown) => {
+    if (typeof workspaceId !== "string" || typeof sessionId !== "string") {
+      throw new Error("恢复工作区状态所需的 ID 无效。");
+    }
+    return activateWorkspace(workspaceId, getClientRuntime(context.clientId), sessionId);
   });
 
   server.handle("session:history", async (context) => {
@@ -365,12 +368,14 @@ async function initializeApplication(): Promise<void> {
   registerRpcHandlers(rpcServer);
   rpcServer.onClientDisconnected((clientId) => {
     // 短暂断线先保留状态，给客户端自动重连机会；超时后再清理 Agent。
+    const previousTimer = clientCleanupTimers.get(clientId);
+    if (previousTimer) clearTimeout(previousTimer);
     const timer = setTimeout(() => {
       clientCleanupTimers.delete(clientId);
       void disposeClientRuntime(clientId).catch((error: unknown) => {
         console.error("Failed to dispose disconnected RPC client:", error);
       });
-    }, 30_000);
+    }, 60_000);
     clientCleanupTimers.set(clientId, timer);
   });
   rpcServer.onClientConnected((clientId) => {

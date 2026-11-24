@@ -57,6 +57,9 @@ declare global {
       // 订阅模型运行事件；返回函数用于取消订阅。
       onAgentEvent(callback: (event: AgentEvent) => void): () => void;
 
+      // 事件缓存过期、需要完整刷新时收到通知。
+      onTransportStale(callback: () => void): () => void;
+
       // 读取当前会话的历史消息
       getHistory(): Promise<CraftChatMessage[]>;
 
@@ -83,6 +86,9 @@ declare global {
 
       // 切换到指定工作区，并取得该工作区的初始数据。
       selectWorkspace(workspaceId: string): Promise<CraftWorkspaceState>;
+
+      // 事件无法补发时，恢复指定工作区和会话的数据。
+      restoreWorkspaceState(workspaceId: string, sessionId: string): Promise<CraftWorkspaceState>;
 
     }
   }
