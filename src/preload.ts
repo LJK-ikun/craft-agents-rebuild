@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld("craftAgent", {
   // invoke 会等主进程处理完，再把回答作为 Promise 返回给界面。
   ask: (userText: string): Promise<string> => ipcRenderer.invoke("agent:ask", userText),
 
+  // 停止当前正在运行的 Agent 请求。
+  cancel: (): Promise<boolean> => ipcRenderer.invoke("agent:cancel"),
+
   // 把工具确认结果送回主进程；网页不能直接访问 Pi 子进程或系统工具。
   respondToPermission: (requestId: string, approved: boolean): Promise<void> =>
     ipcRenderer.invoke("agent:permission-response", requestId, approved),

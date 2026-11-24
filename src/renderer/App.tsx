@@ -58,6 +58,9 @@ export function App() {
   // 保存错误和界面操作状态，避免加载或请求时重复操作。
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelNotice, setCancelNotice] = useState("");
   const [loading, setLoading] = useState(true);
 
   // 订阅主进程转发来的文本片段，并实时追加到最后一条助手消息。
@@ -68,6 +71,11 @@ export function App() {
           ...current.filter((item) => item.requestId !== event.requestId),
           event,
         ]);
+        return;
+      }
+      if (event.type === "cancelled") {
+        setPermissionRequests([]);
+        setCancelNotice("本轮运行已停止，已生成的部分内容保留在对话中。");
         return;
       }
       if (event.type === "tool_start") {
@@ -263,6 +271,23 @@ export function App() {
     }
   }
 
+  // 通知主进程中止当前 Pi prompt；UI 保持忙碌，直到后端确认停止。
+  async function handleCancel() {
+    if (!asking || cancelling) return;
+    setCancelling(true);
+    setError("");
+    try {
+      const accepted = await window.craftAgent.cancel();
+      if (!accepted) {
+        setCancelling(false);
+        setError("当前没有正在运行的请求。");
+      }
+    } catch (cause) {
+      setCancelling(false);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   // 把问题发给当前会话对应的 Agent。
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -271,7 +296,10 @@ export function App() {
     if (!text || busy || loading || !activeSessionId) return;
 
     setBusy(true);
+    setAsking(true);
+    setCancelling(false);
     setError("");
+    setCancelNotice("");
     setToolActivities([]);
     setMessages((current) => [
       ...current,
@@ -305,6 +333,8 @@ export function App() {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
+      setAsking(false);
+      setCancelling(false);
     }
   }
 
@@ -432,8 +462,12 @@ export function App() {
           >
             {busy ? "处理中…" : "发送"}
           </button>
+          <button disabled={!asking || cancelling} onClick={() => void handleCancel()} type="button">
+            {cancelling ? "正在停止…" : "停止"}
+          </button>
         </form>
 
+        {cancelNotice && <p role="status">{cancelNotice}</p>}
         {error && <p role="alert">错误：{error}</p>}
       </section>
     </main>

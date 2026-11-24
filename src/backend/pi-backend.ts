@@ -183,6 +183,11 @@ export class PiBackend implements AgentBackend {
     this.write({ type: "set_permission_mode", mode });
   }
 
+  /** 请求 Pi SDK 中止当前 prompt。 */
+  async cancel(): Promise<void> {
+    if (!this.exited) this.write({ type: "cancel" });
+  }
+
   /** 关闭当前会话的 Pi 子进程，避免切换工作区后遗留后台进程。 */
   async dispose(): Promise<void> {
     if (this.exited) return;
@@ -239,7 +244,11 @@ export class PiBackend implements AgentBackend {
       pendingAsk.events.push(response.event);
 
       // 完成或失败事件到达后关闭对应异步流并清理映射。
-      if (response.event.type === "complete" || response.event.type === "error") {
+      if (
+        response.event.type === "complete" ||
+        response.event.type === "error" ||
+        response.event.type === "cancelled"
+      ) {
         pendingAsk.events.close();
         this.pending.delete(response.id);
       }

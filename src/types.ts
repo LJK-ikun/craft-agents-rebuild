@@ -4,6 +4,7 @@ export type AgentEvent =
   | { type: "permission_request"; requestId: string; toolName: string; input: Record<string, unknown> }
   | { type: "tool_start"; toolCallId: string; toolName: string; input: Record<string, unknown> }
   | { type: "tool_result"; toolCallId: string; toolName: string; result: string; isError: boolean }
+  | { type: "cancelled" }
   | { type: "complete" }
   | { type: "error"; message: string };
 
@@ -26,6 +27,9 @@ export interface AgentBackend {
 
   // 权限模式变更后同步给正在运行的 Agent 后端。
   setPermissionMode?(mode: "explore" | "ask" | "execute"): void;
+
+  // 请求停止当前正在运行的模型或工具循环。
+  cancel?(): Promise<void>;
 
   // 某些后端持有子进程或网络资源，切换会话时需要主动释放。
   dispose?(): Promise<void>;

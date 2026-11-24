@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import { createBackend } from "./backend/factory.ts";
@@ -38,6 +39,8 @@ let activeWorkingDirectory: string | null = null;
 let agent: Agent | null = null;
 let sessionStore: JsonlSessionStore | null = null;
 let activeSessionId: string | null = null;
+// 一个窗口一次只运行一个请求；取消操作必须发回启动该请求的 Agent。
+let activeAsk: { id: string; agent: Agent } | null = null;
 // 权限确认可能晚于会话切换；用 requestId 记录原 Agent，避免把决定发错进程。
 const permissionOwners = new Map<string, Agent>();
 
@@ -246,6 +249,15 @@ ipcMain.handle("session:set-permission-mode", async (_event, mode: unknown) => {
   return mode;
 });
 
+// 界面停止按钮只请求中止当前运行，不会关闭会话或清除已有历史。
+ipcMain.handle("agent:cancel", async () => {
+  const runningAsk = activeAsk;
+  if (!runningAsk) return false;
+
+  await runningAsk.agent.cancel();
+  return true;
+});
+
 // 界面发送问题时，调用当前会话的 Agent，并把问答保存到当前会话。
 ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> => {
   if (typeof userText !== "string" || !userText.trim()) {
@@ -258,38 +270,48 @@ ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> =>
     );
   }
   if (!activeSessionId) throw new Error("当前没有选中的会话。");
+  if (activeAsk) throw new Error("当前已有一条 Agent 请求正在运行。");
 
   // 先保存本次使用的对象和 ID，避免请求等待期间切换会话后存错地方。
   const currentAgent = agent;
   const currentSessionStore = sessionStore;
   const sessionId = activeSessionId;
   const question = userText.trim();
+  const askId = randomUUID();
+  activeAsk = { id: askId, agent: currentAgent };
 
   const answerParts: string[] = [];
 
   // 一边读取后端事件，一边发给 Renderer；同时收集文本用于历史存储。
-  for await (const agentEvent of currentAgent.chat(question)) {
-    if (agentEvent.type === "permission_request") {
-      permissionOwners.set(agentEvent.requestId, currentAgent);
-    }
-    event.sender.send("agent:event", agentEvent);
+  try {
+    for await (const agentEvent of currentAgent.chat(question)) {
+      if (agentEvent.type === "permission_request") {
+        permissionOwners.set(agentEvent.requestId, currentAgent);
+      }
+      if (agentEvent.type === "cancelled") {
+        clearPermissionsForAgent(currentAgent);
+      }
+      event.sender.send("agent:event", agentEvent);
 
-    // 持久化工具轨迹；若日志写入失败，记录错误但不中断模型本轮执行。
-    if (agentEvent.type === "tool_start" || agentEvent.type === "tool_result") {
-      try {
-        await currentSessionStore.appendToolEvent(sessionId, agentEvent);
-      } catch (error) {
-        console.error("Failed to persist tool event:", error);
+      // 持久化工具轨迹；若日志写入失败，记录错误但不中断模型本轮执行。
+      if (agentEvent.type === "tool_start" || agentEvent.type === "tool_result") {
+        try {
+          await currentSessionStore.appendToolEvent(sessionId, agentEvent);
+        } catch (error) {
+          console.error("Failed to persist tool event:", error);
+        }
+      }
+
+      if (agentEvent.type === "text_delta") {
+        answerParts.push(agentEvent.text);
+      }
+
+      if (agentEvent.type === "error") {
+        throw new Error(agentEvent.message);
       }
     }
-
-    if (agentEvent.type === "text_delta") {
-      answerParts.push(agentEvent.text);
-    }
-
-    if (agentEvent.type === "error") {
-      throw new Error(agentEvent.message);
-    }
+  } finally {
+    if (activeAsk?.id === askId) activeAsk = null;
   }
 
   const answer = answerParts.join("");

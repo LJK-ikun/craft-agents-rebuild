@@ -35,6 +35,7 @@ type ServerRequest =
       permissionMode?: "explore" | "ask" | "execute";
     }
   | { type: "ask"; id: string; message: string }
+  | { type: "cancel" }
   | { type: "permission_response"; requestId: string; approved: boolean }
   | { type: "set_permission_mode"; mode: "explore" | "ask" | "execute" }
   | { type: "close" };
@@ -61,6 +62,8 @@ let permissionMode: "explore" | "ask" | "execute" = "ask";
 let workspaceRoot = "";
 // 每个等待用户确认的工具都用 requestId 对应一个 Promise 回调。
 const permissionWaiters = new Map<string, (approved: boolean) => void>();
+// 记录已请求中止的 prompt，避免 agent_end 被误报为正常完成。
+const cancelledRequestIds = new Set<string>();
 
 // 每行是一条独立 JSON 消息，逐条解析并交给对应处理函数。
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -105,6 +108,18 @@ async function handleLine(line: string): Promise<void> {
 
   if (request.type === "set_permission_mode") {
     permissionMode = request.mode;
+    return;
+  }
+
+  if (request.type === "cancel") {
+    const requestId = activeRequestId;
+    if (!session || !requestId) return;
+
+    cancelledRequestIds.add(requestId);
+    // 如果 Agent 正等用户批准某个工具，先拒绝挂起的调用再执行 SDK abort。
+    for (const resolve of permissionWaiters.values()) resolve(false);
+    permissionWaiters.clear();
+    await session.abort();
     return;
   }
 
@@ -340,16 +355,23 @@ async function createPersistentSessionManager(cwd: string, directory: string) {
 async function runPrompt(requestId: string, message: string): Promise<void> {
   try {
     await session!.prompt(message);
+    if (cancelledRequestIds.delete(requestId)) {
+      send({ type: "event", id: requestId, event: { type: "cancelled" } });
+    }
   } catch (error) {
-    send({
-      type: "event",
-      id: requestId,
-      event: {
-        type: "error",
-        message: error instanceof Error ? error.message : String(error),
-      },
-    });
-    send({ type: "event", id: requestId, event: { type: "complete" } });
+    if (cancelledRequestIds.delete(requestId)) {
+      send({ type: "event", id: requestId, event: { type: "cancelled" } });
+    } else {
+      send({
+        type: "event",
+        id: requestId,
+        event: {
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+      send({ type: "event", id: requestId, event: { type: "complete" } });
+    }
   } finally {
     activeRequestId = null;
   }
@@ -428,7 +450,9 @@ function handleSessionEvent(event: AgentSessionEvent): void {
 
   // agent_end 表示 Pi 已完成本轮模型与工具循环。
   if (event.type === "agent_end") {
-    send({ type: "event", id: requestId, event: { type: "complete" } });
+    if (!cancelledRequestIds.has(requestId)) {
+      send({ type: "event", id: requestId, event: { type: "complete" } });
+    }
   }
 }
 

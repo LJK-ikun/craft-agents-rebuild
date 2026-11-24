@@ -45,6 +45,9 @@ declare global {
       // 发送问题，异步取得模型回答
       ask(userText: string): Promise<string>;
 
+      // 请求停止当前运行；没有活动请求时返回 false。
+      cancel(): Promise<boolean>;
+
       // 回答主进程发来的工具权限请求，approved 决定放行还是拒绝。
       respondToPermission(requestId: string, approved: boolean): Promise<void>;
 

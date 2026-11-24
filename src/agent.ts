@@ -19,6 +19,11 @@ export class Agent implements AgentBackend {
     this.backend.setPermissionMode?.(mode);
   }
 
+  // 将停止当前运行的请求转交给具体后端。
+  async cancel(): Promise<void> {
+    await this.backend.cancel?.();
+  }
+
   // 把资源释放请求转交给具体后端；没有资源的后端可以不实现它。
   async dispose(): Promise<void> {
     await this.backend.dispose?.();
