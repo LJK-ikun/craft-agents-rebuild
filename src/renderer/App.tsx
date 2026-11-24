@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import type { ToolActivity } from "../types.ts";
 
 // 一条聊天消息由说话人和文字内容组成。
 type ChatMessage = {
@@ -12,6 +13,7 @@ type Session = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  permissionMode?: "explore" | "ask" | "execute";
 };
 
 // Workspace 列表显示的基本信息。
@@ -29,6 +31,14 @@ type WorkspaceState = {
   sessions: Session[];
   activeSessionId: string;
   messages: ChatMessage[];
+  toolActivities: ToolActivity[];
+};
+
+// 等待用户批准的工具请求：工具名和参数都来自本地 Agent 运行时。
+type PermissionRequest = {
+  requestId: string;
+  toolName: string;
+  input: Record<string, unknown>;
 };
 
 export function App() {
@@ -41,6 +51,9 @@ export function App() {
   // 保存当前会话的消息和输入框内容。
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
+  const [permissionRequests, setPermissionRequests] = useState<PermissionRequest[]>([]);
+  const [toolActivities, setToolActivities] = useState<ToolActivity[]>([]);
+  const [permissionMode, setPermissionMode] = useState<"explore" | "ask" | "execute">("ask");
 
   // 保存错误和界面操作状态，避免加载或请求时重复操作。
   const [error, setError] = useState("");
@@ -50,6 +63,28 @@ export function App() {
   // 订阅主进程转发来的文本片段，并实时追加到最后一条助手消息。
   useEffect(() => {
     return window.craftAgent.onAgentEvent((event) => {
+      if (event.type === "permission_request") {
+        setPermissionRequests((current) => [
+          ...current.filter((item) => item.requestId !== event.requestId),
+          event,
+        ]);
+        return;
+      }
+      if (event.type === "tool_start") {
+        setToolActivities((current) => [
+          ...current.filter((item) => item.toolCallId !== event.toolCallId),
+          { ...event },
+        ]);
+        return;
+      }
+      if (event.type === "tool_result") {
+        setToolActivities((current) => current.map((item) =>
+          item.toolCallId === event.toolCallId
+            ? { ...item, result: event.result, isError: event.isError }
+            : item,
+        ));
+        return;
+      }
       if (event.type !== "text_delta") return;
 
       setMessages((current) => {
@@ -65,6 +100,16 @@ export function App() {
       });
     });
   }, []);
+
+  // 用户明确选择允许或拒绝后，主进程会把决定送回 Pi 子进程。
+  async function handlePermission(requestId: string, approved: boolean) {
+    try {
+      await window.craftAgent.respondToPermission(requestId, approved);
+      setPermissionRequests((current) => current.filter((item) => item.requestId !== requestId));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
 
   // 界面首次打开时，读取 Workspace 列表并恢复第一个工作区。
   useEffect(() => {
@@ -109,6 +154,10 @@ export function App() {
     setSessions(state.sessions);
     setActiveSessionId(state.activeSessionId);
     setMessages(state.messages);
+    setToolActivities(state.toolActivities);
+    const activeSession = state.sessions.find((session) => session.id === state.activeSessionId);
+    setPermissionMode(activeSession?.permissionMode ?? "ask");
+    setPermissionRequests([]);
     setQuestion("");
   }
 
@@ -171,6 +220,9 @@ export function App() {
       setSessions((current) => [result.session, ...current]);
       setActiveSessionId(result.session.id);
       setMessages(result.messages);
+      setToolActivities([]);
+      setPermissionMode(result.session.permissionMode ?? "ask");
+      setPermissionRequests([]);
       setQuestion("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -189,12 +241,25 @@ export function App() {
     try {
       const history = await window.craftAgent.selectSession(sessionId);
       setActiveSessionId(sessionId);
-      setMessages(history);
+      setMessages(history.messages);
+      setToolActivities(history.toolActivities);
+      setPermissionMode(sessions.find((session) => session.id === sessionId)?.permissionMode ?? "ask");
+      setPermissionRequests([]);
       setQuestion("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
+    }
+  }
+
+  // 改变权限模式时由主进程校验并保存，切换后端行为也同步生效。
+  async function handlePermissionModeChange(mode: "explore" | "ask" | "execute") {
+    try {
+      await window.craftAgent.setPermissionMode(mode);
+      setPermissionMode(mode);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
     }
   }
 
@@ -207,6 +272,7 @@ export function App() {
 
     setBusy(true);
     setError("");
+    setToolActivities([]);
     setMessages((current) => [
       ...current,
       { role: "user", content: text },
@@ -291,12 +357,38 @@ export function App() {
       <section style={{ flex: 1 }}>
         <h1>Craft Agents Learning Rebuild</h1>
 
+        <label>
+          工具权限：
+          <select
+            onChange={(event) => void handlePermissionModeChange(event.target.value as "explore" | "ask" | "execute")}
+            value={permissionMode}
+          >
+            <option value="explore">探索：只读</option>
+            <option value="ask">询问：写入/命令前确认</option>
+            <option value="execute">执行：自动放行</option>
+          </select>
+        </label>
+
         {loading && <p>正在加载工作区…</p>}
         {!loading && workspaces.length === 0 && (
           <p>还没有工作区。点击“添加工作区”选择一个项目文件夹。</p>
         )}
 
         <section aria-label="聊天记录" aria-live="polite">
+          {toolActivities.map((activity) => (
+            <article key={activity.toolCallId} style={{ borderLeft: "3px solid #888", margin: "12px 0", paddingLeft: 12 }}>
+              <strong>工具：{activity.toolName}</strong>
+              <pre style={{ overflowX: "auto", whiteSpace: "pre-wrap" }}>
+                {JSON.stringify(activity.input, null, 2)}
+              </pre>
+              {activity.result !== undefined && (
+                <details open={activity.isError}>
+                  <summary>{activity.isError ? "执行失败" : "执行结果"}</summary>
+                  <pre style={{ overflowX: "auto", whiteSpace: "pre-wrap" }}>{activity.result}</pre>
+                </details>
+              )}
+            </article>
+          ))}
           {messages.map((message, index) => (
             <article key={`${index}-${message.role}`}>
               <strong>{message.role === "user" ? "你" : "助手"}</strong>
@@ -304,6 +396,27 @@ export function App() {
             </article>
           ))}
         </section>
+
+        {permissionRequests.map((request) => (
+          <aside
+            aria-label="工具执行确认"
+            key={request.requestId}
+            role="alertdialog"
+            style={{ border: "1px solid #c98b22", margin: "16px 0", padding: 16 }}
+          >
+            <h2>Agent 请求执行工具：{request.toolName}</h2>
+            <p>确认后，工具会在当前工作区中执行下面的操作：</p>
+            <pre style={{ overflowX: "auto", whiteSpace: "pre-wrap" }}>
+              {JSON.stringify(request.input, null, 2)}
+            </pre>
+            <button onClick={() => void handlePermission(request.requestId, true)} type="button">
+              允许执行
+            </button>
+            <button onClick={() => void handlePermission(request.requestId, false)} type="button">
+              拒绝
+            </button>
+          </aside>
+        ))}
 
         <form onSubmit={handleSubmit}>
           <textarea

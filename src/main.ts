@@ -38,6 +38,15 @@ let activeWorkingDirectory: string | null = null;
 let agent: Agent | null = null;
 let sessionStore: JsonlSessionStore | null = null;
 let activeSessionId: string | null = null;
+// 权限确认可能晚于会话切换；用 requestId 记录原 Agent，避免把决定发错进程。
+const permissionOwners = new Map<string, Agent>();
+
+function clearPermissionsForAgent(target: Agent | null): void {
+  if (!target) return;
+  for (const [requestId, owner] of permissionOwners) {
+    if (owner === target) permissionOwners.delete(requestId);
+  }
+}
 
 // 为一个应用会话创建 Agent，并把 Pi SDK 数据隔离到该会话的目录。
 function createAgent(
@@ -52,6 +61,7 @@ function createAgent(
     provider: backendProvider,
     model: modelName,
     piAuthProvider,
+    permissionMode: session.permissionMode ?? "ask",
     piSessionDirectory: path.join(
       currentSessionStore.getSessionDirectory(session.id),
       ".pi-sessions",
@@ -65,7 +75,7 @@ function createAgent(
       currentSessionStore.saveSdkSessionId(session.id, sdkSessionId),
   };
 
-  return new Agent(createBackend(config));
+  return new Agent(createBackend(config, currentDirectory));
 }
 
 // 切换到指定工作区，并加载它自己的会话和聊天历史。
@@ -90,8 +100,11 @@ async function activateWorkspace(workspaceId: string) {
 
   // 读取默认会话的消息，并用它们创建 Agent。
   const messages = await nextSessionStore.loadMessages(sessionId);
+  const toolActivities = await nextSessionStore.loadToolActivities(sessionId);
 
   // 确认数据读取成功后，再把当前状态切换到目标工作区。
+  clearPermissionsForAgent(agent);
+  await agent?.dispose();
   activeWorkspaceId = workspace.id;
   activeWorkingDirectory = workspace.workingDirectory;
   activeSessionId = sessionId;
@@ -109,6 +122,7 @@ async function activateWorkspace(workspaceId: string) {
     sessions,
     activeSessionId: sessionId,
     messages,
+    toolActivities,
   };
 }
 
@@ -126,6 +140,10 @@ ipcMain.handle("session:create", async () => {
 
   // 在索引里创建会话记录，并取得新会话的唯一 ID。
   const session = await sessionStore.createSession();
+
+  // 关闭旧会话的模型进程，避免切换后仍留在后台。
+  clearPermissionsForAgent(agent);
+  await agent?.dispose();
 
   // 更新当前会话 ID，后续发送的问题就会保存到这个会话。
   activeSessionId = session.id;
@@ -145,10 +163,15 @@ ipcMain.handle("session:select", async (_event, sessionId: unknown) => {
   }
 
   const messages = await sessionStore.loadMessages(sessionId)
+  const toolActivities = await sessionStore.loadToolActivities(sessionId);
   const sessions = await sessionStore.listSessions();
   const selectedSession = sessions.find((session) => session.id === sessionId);
   if (!selectedSession) throw new Error("找不到指定会话。");
   if (!activeWorkingDirectory) throw new Error("当前工作区尚未初始化。");
+
+  // 关闭旧会话的模型进程，再创建所选会话的 Agent。
+  clearPermissionsForAgent(agent);
+  await agent?.dispose();
 
   // 成功读到目标绘画后，再更新当前会话状态
   activeSessionId = sessionId;
@@ -159,7 +182,7 @@ ipcMain.handle("session:select", async (_event, sessionId: unknown) => {
     messages,
   )
 
-  return messages
+  return { messages, toolActivities }
 })
 // 返回所有已登记的工作区，供界面显示工作区列表。
 ipcMain.handle("workspace:list", async () => {
@@ -199,6 +222,30 @@ ipcMain.handle("session:history", async () => {
   return sessionStore.loadMessages(activeSessionId);
 });
 
+// 只有当前确实发出过该权限请求的 Agent，才能收到界面的批准结果。
+ipcMain.handle("agent:permission-response", (_event, requestId: unknown, approved: unknown) => {
+  if (typeof requestId !== "string" || typeof approved !== "boolean") {
+    throw new Error("工具权限响应无效。");
+  }
+  const owner = permissionOwners.get(requestId);
+  if (!owner) throw new Error("该工具请求已失效或已经处理。");
+
+  permissionOwners.delete(requestId);
+  owner.respondToPermission?.(requestId, approved);
+});
+
+// 保存当前会话的权限模式，并立即同步给当前运行中的 Pi Agent。
+ipcMain.handle("session:set-permission-mode", async (_event, mode: unknown) => {
+  if (mode !== "explore" && mode !== "ask" && mode !== "execute") {
+    throw new Error("权限模式无效。");
+  }
+  if (!sessionStore || !activeSessionId) throw new Error("当前没有活动会话。");
+
+  await sessionStore.savePermissionMode(activeSessionId, mode);
+  agent?.setPermissionMode(mode);
+  return mode;
+});
+
 // 界面发送问题时，调用当前会话的 Agent，并把问答保存到当前会话。
 ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> => {
   if (typeof userText !== "string" || !userText.trim()) {
@@ -222,7 +269,19 @@ ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> =>
 
   // 一边读取后端事件，一边发给 Renderer；同时收集文本用于历史存储。
   for await (const agentEvent of currentAgent.chat(question)) {
+    if (agentEvent.type === "permission_request") {
+      permissionOwners.set(agentEvent.requestId, currentAgent);
+    }
     event.sender.send("agent:event", agentEvent);
+
+    // 持久化工具轨迹；若日志写入失败，记录错误但不中断模型本轮执行。
+    if (agentEvent.type === "tool_start" || agentEvent.type === "tool_result") {
+      try {
+        await currentSessionStore.appendToolEvent(sessionId, agentEvent);
+      } catch (error) {
+        console.error("Failed to persist tool event:", error);
+      }
+    }
 
     if (agentEvent.type === "text_delta") {
       answerParts.push(agentEvent.text);
@@ -288,4 +347,24 @@ void app.whenReady().then(createMainWindow).catch((error: unknown) => {
 // macOS 通常在关闭最后一个窗口后保留应用；其他平台则退出应用。
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+// 先等待 Agent 子进程关闭，再让 Electron 正常退出。
+let isQuitting = false;
+app.on("before-quit", (event) => {
+  if (isQuitting) return;
+
+  isQuitting = true;
+  event.preventDefault();
+
+  const agentToDispose = agent;
+  clearPermissionsForAgent(agentToDispose);
+  agent = null;
+
+  const disposePromise = agentToDispose?.dispose() ?? Promise.resolve();
+  void disposePromise.catch((error: unknown) => {
+    console.error("Failed to dispose the active agent:", error);
+  }).finally(() => {
+    app.quit();
+  });
 });

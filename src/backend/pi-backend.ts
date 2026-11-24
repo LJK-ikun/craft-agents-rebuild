@@ -1,39 +1,39 @@
-import type {
-  AgentSession,
-  AgentSessionEvent,
-} from "@earendil-works/pi-coding-agent";
-import { createPiSession } from "./pi-session.ts";
-import type {
-  AgentBackend,
-  AgentEvent,
-  BackendConfig,
-} from "../types.ts";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
+import { createInterface } from "node:readline";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import type { AgentBackend, AgentEvent, BackendConfig } from "../types.ts";
+
+// 主进程和 Pi 子进程只交换 JSONL 消息，不共享 SDK 对象。
+type PiServerResponse =
+  | { type: "ready" }
+  | { type: "event"; id: string; event: AgentEvent }
+  | { type: "permission_request"; id: string; requestId: string; toolName: string; input: Record<string, unknown> }
+  | { type: "error"; id?: string; message: string };
 
 /**
- * 一个很小的异步事件队列：
- * Pi 通过回调推送事件，AgentBackend.chat() 则通过 async generator 逐条读取。
+ * 把回调式的子进程事件转换成可供 for-await 消费的异步队列。
+ * Pi 子进程写一行 JSONL，客户端解析后把事件推入这个队列。
  */
 class AgentEventQueue implements AsyncIterable<AgentEvent> {
-  // 暂时还没有消费者读取的事件。
+  // 暂时没有被消费者取走的事件。
   private readonly events: AgentEvent[] = [];
-  // 正在等待下一条事件的读取者。
+  // 正在等待下一条事件的消费者。
   private readonly waiters: Array<(event: AgentEvent | null) => void> = [];
-  // 事件结束后阻止队列继续接收新事件。
+  // 队列关闭后不再接受事件。
   private closed = false;
 
-  /** 把事件交给一个等待者，或先放进队列等待读取。 */
+  /** 收到事件时唤醒等待者；没有等待者时先缓存事件。 */
   push(event: AgentEvent): void {
     if (this.closed) return;
 
     const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter(event);
-    } else {
-      this.events.push(event);
-    }
+    if (waiter) waiter(event);
+    else this.events.push(event);
   }
 
-  /** 标记队列结束，并唤醒所有等待中的读取者。 */
+  /** 通知消费者本轮事件流结束。 */
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -43,7 +43,7 @@ class AgentEventQueue implements AsyncIterable<AgentEvent> {
     }
   }
 
-  /** 允许调用方使用 for await 按顺序消费所有事件。 */
+  /** 让调用方按顺序逐条读取事件。 */
   async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
     while (true) {
       const savedEvent = this.events.shift();
@@ -57,97 +57,233 @@ class AgentEventQueue implements AsyncIterable<AgentEvent> {
       const nextEvent = await new Promise<AgentEvent | null>((resolve) => {
         this.waiters.push(resolve);
       });
-
       if (nextEvent === null) return;
       yield nextEvent;
     }
   }
 }
 
-/** 把 Pi SDK 的会话事件转换成应用统一的 AgentEvent。 */
+/** 每个正在运行的提问都拥有自己的事件队列。 */
+type PendingAsk = { events: AgentEventQueue };
+
+/**
+ * Electron 主进程中的 Pi 客户端。
+ * 真正的 Pi SDK 会在 Bun 子进程运行，避免把 SDK 运行时放进 Electron 主进程。
+ */
 export class PiBackend implements AgentBackend {
-  // 延迟创建 Pi 会话，并在本后端实例的整个生命周期内复用它。
-  private sessionPromise: Promise<AgentSession> | null = null;
+  // 子进程句柄；stdin/stdout/stderr 都是可用的管道。
+  private readonly child: ChildProcessWithoutNullStreams;
+  // 等待 Pi 子进程完成初始化后，chat 才能发送问题。
+  private readonly ready: Promise<void>;
+  // 用 request ID 将并发中的问题和对应事件流配对。
+  private readonly pending = new Map<string, PendingAsk>();
+  // 初始化 Promise 的回调由 ready 消息或启动错误触发。
+  private resolveReady!: () => void;
+  private rejectReady!: (error: Error) => void;
+  // 防止进程退出后又被误认为仍可使用。
+  private exited = false;
 
-  constructor(private readonly config: BackendConfig) {}
+  constructor(
+    private readonly config: BackendConfig,
+    serverScript: string,
+  ) {
+    // Pi SDK 放进独立 Bun 进程；Electron 主进程只负责 JSONL 通信。
+    const bunExecutable = process.env.BUN_EXECUTABLE || "bun";
+    this.child = spawn(bunExecutable, ["run", serverScript], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
 
-  /** 第一次提问时创建 Pi 会话；后续提问继续使用同一个会话。 */
-  private getSession(): Promise<AgentSession> {
-    if (!this.sessionPromise) {
-      this.sessionPromise = createPiSession(this.config);
-    }
-    return this.sessionPromise;
+    // 先注册 ready Promise 的回调，再监听 stdout，避免漏掉快速返回的 ready。
+    this.ready = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    // 先登记拒绝处理，避免子进程在用户第一次提问前启动失败时产生未处理 Promise。
+    void this.ready.catch(() => undefined);
+
+    // stdout 是 JSONL 协议通道：每一行都必须是一个完整 JSON 消息。
+    const lines = createInterface({
+      input: this.child.stdout,
+      crlfDelay: Infinity,
+    });
+    lines.on("line", (line) => this.handleServerLine(line));
+
+    // stderr 只承载诊断日志，不会污染 stdout 上的 JSONL 协议。
+    this.child.stderr.on("data", (chunk: Buffer) => {
+      process.stderr.write(`[Pi server] ${chunk.toString()}`);
+    });
+
+    // 启动失败时，让初始化和所有等待中的提问都收到明确错误。
+    this.child.on("error", (error) => this.failAll(error));
+    this.child.on("exit", (code, signal) => {
+      this.exited = true;
+      this.failAll(
+        new Error(`Pi 子进程退出：code=${code ?? "null"}, signal=${signal ?? "null"}`),
+      );
+    });
+
+    // 初始化消息把模型和凭证交给 Pi 子进程；密钥不会发给 Renderer。
+    this.write({
+      type: "init",
+      cwd: config.workingDirectory,
+      provider: config.piAuthProvider,
+      model: config.model,
+      apiKey: config.apiKey,
+      systemPrompt: config.systemPrompt,
+      sessionDirectory: config.piSessionDirectory,
+      permissionMode: config.permissionMode,
+    });
   }
 
-  /** 发送用户问题，并把 Pi 的流式输出逐条交给主进程。 */
+  /** 启动一次提问，并实时产出 Pi 子进程发回的事件。 */
   async *chat(message: string): AsyncGenerator<AgentEvent> {
-    let session: AgentSession;
-
-    // 会话初始化失败也转换成统一错误事件，避免泄漏 SDK 错误对象。
     try {
-      session = await this.getSession();
+      // Pi session 初始化完成前不能发送 ask。
+      await this.ready;
+
+      if (this.exited) throw new Error("Pi 子进程已经退出。");
+
+      // request ID 让多个请求的结果不会串到错误的聊天流里。
+      const id = randomUUID();
+      const events = new AgentEventQueue();
+      this.pending.set(id, { events });
+
+      try {
+        this.write({ type: "ask", id, message });
+      } catch (error) {
+        this.pending.delete(id);
+        events.push({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        events.close();
+      }
+
+      // 收到一条就向上 yield 一条，Renderer 可以逐段显示模型回答。
+      for await (const event of events) {
+        yield event;
+      }
     } catch (error) {
+      // 启动或等待初始化失败时，也通过统一 AgentEvent 告诉 UI。
       yield {
         type: "error",
         message: error instanceof Error ? error.message : String(error),
       };
+    }
+  }
+
+  /** 把界面的允许/拒绝结果送回 Pi 子进程，解除工具执行的等待。 */
+  respondToPermission(requestId: string, approved: boolean): void {
+    this.write({ type: "permission_response", requestId, approved });
+  }
+
+  /** 将会话权限模式变更通知正在运行的 Pi 子进程。 */
+  setPermissionMode(mode: "explore" | "ask" | "execute"): void {
+    this.write({ type: "set_permission_mode", mode });
+  }
+
+  /** 关闭当前会话的 Pi 子进程，避免切换工作区后遗留后台进程。 */
+  async dispose(): Promise<void> {
+    if (this.exited) return;
+
+    // 通知子进程释放 Pi session，然后结束 stdin，作为额外的关闭信号。
+    try {
+      this.write({ type: "close" });
+      this.child.stdin.end();
+    } catch {
+      this.child.kill();
+    }
+
+    // 正常等待子进程退出；若 SDK 未能及时退出，再强制结束它。
+    await Promise.race([
+      once(this.child, "exit").then(() => undefined),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          if (!this.exited) this.child.kill();
+          resolve();
+        }, 2_000);
+        timer.unref();
+      }),
+    ]);
+  }
+
+  /** 解析子进程的一行 JSONL 响应，并路由到对应请求。 */
+  private handleServerLine(line: string): void {
+    let response: PiServerResponse;
+
+    try {
+      response = JSON.parse(line) as PiServerResponse;
+    } catch {
+      process.stderr.write(`[Pi server] 忽略无效 JSONL：${line}\n`);
       return;
     }
 
-    const queue = new AgentEventQueue();
+    // ready 表示 SDK、模型和会话初始化完成。
+    if (response.type === "ready") {
+      this.resolveReady();
+      return;
+    }
 
-    // 监听 Pi SDK 事件，并只挑当前应用需要的事件转换。
-    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-      // message_update 的 text_delta 是模型刚生成的一段文字。
-      if (
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
-        queue.push({
-          type: "text_delta",
-          text: event.assistantMessageEvent.delta,
-        });
+    // 没有 request ID 的错误发生在会话初始化阶段。
+    if (response.type === "error" && !response.id) {
+      this.rejectReady(new Error(response.message));
+      return;
+    }
+
+    if (!response.id) return;
+    const pendingAsk = this.pending.get(response.id);
+    if (!pendingAsk) return;
+
+    if (response.type === "event") {
+      pendingAsk.events.push(response.event);
+
+      // 完成或失败事件到达后关闭对应异步流并清理映射。
+      if (response.event.type === "complete" || response.event.type === "error") {
+        pendingAsk.events.close();
+        this.pending.delete(response.id);
       }
+      return;
+    }
 
-      // assistant 消息以 error 结束时，把错误文本交给应用层。
-      if (
-        event.type === "message_end" &&
-        event.message.role === "assistant" &&
-        event.message.stopReason === "error"
-      ) {
-        queue.push({
-          type: "error",
-          message: event.message.errorMessage || "Pi 模型请求失败。",
-        });
-      }
-
-      // agent_end 表示这一轮 Pi Agent 工作结束。
-      if (event.type === "agent_end") {
-        queue.push({ type: "complete" });
-        queue.close();
-      }
-    });
-
-    try {
-      // prompt 启动 Pi 的模型循环；SDK 事件由上方订阅回调推入队列。
-      const promptTask = session.prompt(message).catch((error: unknown) => {
-        queue.push({
-          type: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
-        queue.close();
+    if (response.type === "permission_request") {
+      pendingAsk.events.push({
+        type: "permission_request",
+        requestId: response.requestId,
+        toolName: response.toolName,
+        input: response.input,
       });
+      return;
+    }
 
-      // Pi 每产生一条文字事件，就立即 yield 给 Electron 主进程。
-      for await (const event of queue) {
-        yield event;
-      }
+    pendingAsk.events.push({ type: "error", message: response.message });
+    pendingAsk.events.close();
+    this.pending.delete(response.id);
+  }
 
-      // 等待 prompt 本身结束，避免后台请求还没收尾就退出。
-      await promptTask;
-    } finally {
-      // 每轮结束后取消订阅，避免后续问题收到重复事件。
-      unsubscribe();
+  /** 子进程意外退出时，拒绝启动等待并结束所有活跃事件流。 */
+  private failAll(error: Error): void {
+    this.exited = true;
+    this.rejectReady(error);
+
+    for (const [id, pendingAsk] of this.pending) {
+      pendingAsk.events.push({ type: "error", message: error.message });
+      pendingAsk.events.close();
+      this.pending.delete(id);
     }
   }
+
+  /** 把一个对象编码成单行 JSON，再写入子进程 stdin。 */
+  private write(message: object): void {
+    if (this.child.stdin.destroyed || this.exited) {
+      throw new Error("Pi 子进程输入管道已关闭。");
+    }
+
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+}
+
+/** 构建产物中的 main.mjs 位于 dist，因此 Pi server 也从 dist/backend 加载。 */
+export function resolvePiServerScript(mainDirectory: string): string {
+  return path.join(mainDirectory, "backend", "pi-agent-server.js");
 }

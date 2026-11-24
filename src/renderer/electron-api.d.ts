@@ -1,6 +1,7 @@
 // 让TypeScript 把本文件当作模块
 // 这样下面才能使用 declare global 拓展全局 Window 类型
 import type { AgentEvent } from "../types.ts";
+import type { ToolActivity } from "../types.ts";
 export {};
 
 // 描述一条聊天消息，和主进程，存储层使用的数据结构一致
@@ -15,6 +16,7 @@ type CraftSession = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  permissionMode?: "explore" | "ask" | "execute";
 }
 
 // 描述一个工作区：rootPath 存 Craft 管理的数据，workingDirectory 是项目目录。
@@ -32,6 +34,7 @@ type CraftWorkspaceState = {
   sessions: CraftSession[];
   activeSessionId: string;
   messages: CraftChatMessage[];
+  toolActivities: ToolActivity[];
 };
 
 // 扩展浏览器环境中的全局 Window 类型
@@ -41,6 +44,12 @@ declare global {
     craftAgent: {
       // 发送问题，异步取得模型回答
       ask(userText: string): Promise<string>;
+
+      // 回答主进程发来的工具权限请求，approved 决定放行还是拒绝。
+      respondToPermission(requestId: string, approved: boolean): Promise<void>;
+
+      // 设置该会话的工具权限：探索只读、询问逐次确认、执行自动放行。
+      setPermissionMode(mode: "explore" | "ask" | "execute"): Promise<string>;
 
       // 订阅模型运行事件；返回函数用于取消订阅。
       onAgentEvent(callback: (event: AgentEvent) => void): () => void;
@@ -58,7 +67,10 @@ declare global {
       }>;
 
       // 切换会话，并取得该会话的历史消息
-      selectSession(sessionId: string): Promise<CraftChatMessage[]>;
+      selectSession(sessionId: string): Promise<{
+        messages: CraftChatMessage[];
+        toolActivities: ToolActivity[];
+      }>;
 
       // 获取所有已登记的工作区。
       listWorkspaces(): Promise<CraftWorkspace[]>;

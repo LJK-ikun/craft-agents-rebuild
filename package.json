@@ -7,7 +7,8 @@
     "dev:ui": "vite --host 127.0.0.1",
     "build:main": "esbuild src/main.ts --bundle --platform=node --format=esm --outfile=dist/main.mjs --external:electron --external:@anthropic-ai/claude-agent-sdk --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-agent-core --external:@earendil-works/pi-ai",
     "build:preload": "esbuild src/preload.ts --bundle --platform=node --format=cjs --outfile=dist/preload.cjs --external:electron",
-    "dev:desktop": "npm run build:main && npm run build:preload && electron .",
+    "build:pi-server": "bun build src/backend/pi-server.ts --outfile=dist/backend/pi-agent-server.js --target=bun --format=esm",
+    "dev:desktop": "npm run build:main && npm run build:preload && npm run build:pi-server && electron .",
     "build:ui": "vite build"
   },
   "devDependencies": {

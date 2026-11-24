@@ -6,6 +6,7 @@ import path from "node:path";
 
 // randomUUID：为新会话生成不重复的 ID。
 import { randomUUID } from "node:crypto";
+import type { AgentEvent, ToolActivity } from "./types.ts";
 
 // 描述一条聊天消息的数据结构。
 // role 表示说话人；content 表示这条消息的文字。
@@ -22,6 +23,7 @@ export type SessionRecord = {
   createdAt: string; // 会话创建时间，使用 ISO 时间格式。
   updatedAt: string; // 最近一次保存消息的时间。
   sdkSessionId?: string; // Claude SDK 的会话 ID，用来在下次提问时恢复上下文。
+  permissionMode?: "explore" | "ask" | "execute"; // 该会话的工具执行权限模式。
 };
 
 // 负责管理所有会话的本地文件。
@@ -40,6 +42,11 @@ export class JsonlSessionStore {
   // 例如 ID 是 "default"，路径会是 sessions/default/session.jsonl。
   private getSessionFilePath(sessionId: string): string {
     return path.join(this.rootDirectory, sessionId, "session.jsonl");
+  }
+
+  // 工具轨迹独立于聊天消息保存，避免把 tool 事件伪装成 user/assistant 消息。
+  private getToolEventsFilePath(sessionId: string): string {
+    return path.join(this.rootDirectory, sessionId, "tool-events.jsonl");
   }
 
   // 返回会话自己的目录，供 Pi SDK 在其中保存该会话的运行记录。
@@ -126,6 +133,19 @@ export class JsonlSessionStore {
     await this.saveSessions(sessions);
   }
 
+  // 保存会话的工具权限模式；旧会话没有此字段时按 ask 模式处理。
+  async savePermissionMode(
+    sessionId: string,
+    permissionMode: NonNullable<SessionRecord["permissionMode"]>,
+  ): Promise<void> {
+    const sessions = await this.listSessions();
+    const sessionIndex = sessions.findIndex((session) => session.id === sessionId);
+    if (sessionIndex === -1) throw new Error("找不到要更新权限模式的会话。");
+
+    sessions[sessionIndex] = { ...sessions[sessionIndex], permissionMode };
+    await this.saveSessions(sessions);
+  }
+
   // 读取指定会话中的全部消息。
   async loadMessages(sessionId: string): Promise<ConversationMessage[]> {
     // 先读取会话列表，确认传入的 ID 确实存在。
@@ -158,6 +178,62 @@ export class JsonlSessionStore {
       // 其他问题，例如文件损坏或读取权限错误，不能伪装成空会话。
       throw error;
     }
+  }
+
+  // 读取工具事件日志，并把同一 toolCallId 的开始与结果合并成一张卡片。
+  async loadToolActivities(sessionId: string): Promise<ToolActivity[]> {
+    const sessions = await this.listSessions();
+    if (!sessions.some((session) => session.id === sessionId)) {
+      throw new Error("找不到指定会话。");
+    }
+
+    let text: string;
+    try {
+      text = await readFile(this.getToolEventsFilePath(sessionId), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+
+    const activities = new Map<string, ToolActivity>();
+    for (const line of text.split(/\r?\n/).filter(Boolean)) {
+      const event = JSON.parse(line) as Extract<AgentEvent, { type: "tool_start" | "tool_result" }>;
+      if (event.type === "tool_start") {
+        activities.set(event.toolCallId, {
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          input: event.input,
+        });
+      } else {
+        const current = activities.get(event.toolCallId) ?? {
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          input: {},
+        };
+        activities.set(event.toolCallId, {
+          ...current,
+          result: event.result,
+          isError: event.isError,
+        });
+      }
+    }
+
+    return [...activities.values()];
+  }
+
+  // 把工具开始/结束事件追加写入该会话的独立 JSONL 轨迹文件。
+  async appendToolEvent(
+    sessionId: string,
+    event: Extract<AgentEvent, { type: "tool_start" | "tool_result" }>,
+  ): Promise<void> {
+    const sessions = await this.listSessions();
+    if (!sessions.some((session) => session.id === sessionId)) {
+      throw new Error("找不到指定会话。");
+    }
+
+    const filePath = this.getToolEventsFilePath(sessionId);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await appendFile(filePath, `${JSON.stringify(event)}\n`, "utf8");
   }
 
   // 把一条消息保存到指定会话，并更新会话的最近活动时间。

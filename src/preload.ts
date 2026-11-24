@@ -7,6 +7,14 @@ contextBridge.exposeInMainWorld("craftAgent", {
   // invoke 会等主进程处理完，再把回答作为 Promise 返回给界面。
   ask: (userText: string): Promise<string> => ipcRenderer.invoke("agent:ask", userText),
 
+  // 把工具确认结果送回主进程；网页不能直接访问 Pi 子进程或系统工具。
+  respondToPermission: (requestId: string, approved: boolean): Promise<void> =>
+    ipcRenderer.invoke("agent:permission-response", requestId, approved),
+
+  // 修改当前会话的权限模式；主进程会先保存，再通知 Agent 后端。
+  setPermissionMode: (mode: "explore" | "ask" | "execute"): Promise<string> =>
+    ipcRenderer.invoke("session:set-permission-mode", mode),
+
   // 只暴露 Agent 事件订阅方法，不把整个 ipcRenderer 交给网页。
   onAgentEvent: (callback: (event: AgentEvent) => void): (() => void) => {
     const listener = (_ipcEvent: IpcRendererEvent, event: AgentEvent) => {
