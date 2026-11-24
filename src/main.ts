@@ -179,6 +179,34 @@ async function activateWorkspace(
   };
 }
 
+// 断线事件过期时重载界面数据；若仍是同一会话，保留正在运行的 Agent。
+async function restoreWorkspaceState(
+  workspaceId: string,
+  sessionId: string,
+  runtime: ClientRuntime,
+) {
+  if (
+    runtime.activeWorkspaceId === workspaceId &&
+    runtime.activeSessionId === sessionId &&
+    runtime.sessionStore
+  ) {
+    const workspaces = await workspaceStore.list();
+    const workspace = workspaces.find((item) => item.id === workspaceId);
+    const sessions = await runtime.sessionStore.listSessions();
+    if (workspace && sessions.some((item) => item.id === sessionId)) {
+      return {
+        workspace,
+        sessions,
+        activeSessionId: sessionId,
+        messages: await runtime.sessionStore.loadMessages(sessionId),
+        toolActivities: await runtime.sessionStore.loadToolActivities(sessionId),
+      };
+    }
+  }
+
+  return activateWorkspace(workspaceId, runtime, sessionId);
+}
+
 // 把应用业务能力注册到 WebSocket-RPC；Renderer 只能调用这里明确开放的频道。
 function registerRpcHandlers(server: CraftRpcServer): void {
   // 读取本客户端当前工作区中的会话列表，不会读到别的客户端选择状态。
@@ -245,7 +273,7 @@ function registerRpcHandlers(server: CraftRpcServer): void {
     if (typeof workspaceId !== "string" || typeof sessionId !== "string") {
       throw new Error("恢复工作区状态所需的 ID 无效。");
     }
-    return activateWorkspace(workspaceId, getClientRuntime(context.clientId), sessionId);
+    return restoreWorkspaceState(workspaceId, sessionId, getClientRuntime(context.clientId));
   });
 
   server.handle("session:history", async (context) => {
