@@ -15,7 +15,7 @@ import type { RpcBootstrap } from "./transport/rpc-types.ts";
 import type { AgentProvider, BackendConfig } from "./types.ts";
 
 // 从 Electron 导入应用生命周期、窗口、目录选择框和 IPC 注册工具。
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 // ESM 文件没有内置 __dirname：从当前文件地址得到它所在目录
 const currentFile = fileURLToPath(import.meta.url);
 const currentDirectory = path.dirname(currentFile);
@@ -52,6 +52,8 @@ type ClientRuntime = {
 };
 
 const clientRuntimes = new Map<string, ClientRuntime>();
+// 同一个持久化会话同一时刻只允许一个客户端运行，防止共享 Pi 会话目录被并发写入。
+const sessionAskOwners = new Map<string, string>();
 // 每个确认请求记录发起它的 Agent 和客户端，避免其他客户端代为批准。
 const permissionOwners = new Map<string, { agent: Agent; clientId: string }>();
 
@@ -270,12 +272,17 @@ function registerRpcHandlers(server: CraftRpcServer): void {
       throw new Error("请设置 PI_API_KEY（或 ANTHROPIC_API_KEY）；可选设置 PI_AUTH_PROVIDER 和 PI_MODEL。");
     }
     if (runtime.activeAsk) throw new Error("当前客户端已有一条 Agent 请求正在运行。");
+    const sessionKey = `${runtime.activeWorkspaceId}:${runtime.activeSessionId}`;
+    if (sessionAskOwners.has(sessionKey)) {
+      throw new Error("这个会话正在另一个窗口运行，请切换到其他会话后再提问。");
+    }
 
     const currentAgent = runtime.agent;
     const currentStore = runtime.sessionStore;
     const sessionId = runtime.activeSessionId;
     const askId = randomUUID();
     const question = userText.trim();
+    sessionAskOwners.set(sessionKey, context.clientId);
     runtime.activeAsk = { id: askId, agent: currentAgent };
     const answerParts: string[] = [];
 
@@ -297,19 +304,41 @@ function registerRpcHandlers(server: CraftRpcServer): void {
         if (event.type === "text_delta") answerParts.push(event.text);
         if (event.type === "error") throw new Error(event.message);
       }
+
+      // 把本轮问答写完后才释放会话锁，防止另一个窗口抢在保存前启动。
+      const answer = answerParts.join("");
+      await currentStore.appendMessage(sessionId, { role: "user", content: question });
+      await currentStore.appendMessage(sessionId, { role: "assistant", content: answer });
+      return answer;
     } finally {
       if (runtime.activeAsk?.id === askId) runtime.activeAsk = null;
+      if (sessionAskOwners.get(sessionKey) === context.clientId) sessionAskOwners.delete(sessionKey);
     }
-
-    const answer = answerParts.join("");
-    await currentStore.appendMessage(sessionId, { role: "user", content: question });
-    await currentStore.appendMessage(sessionId, { role: "assistant", content: answer });
-    return answer;
   });
 }
 
-// 创建窗口前先恢复默认会话及历史
-async function createMainWindow(): Promise<void> {
+// 为每个 Renderer 创建一个独立窗口；Preload 会建立自己的 RPC 客户端连接。
+function createWindow(): BrowserWindow {
+  const window = new BrowserWindow({
+    width: 1100,
+    height: 760,
+    webPreferences: {
+      preload: path.join(currentDirectory, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  if (app.isPackaged) {
+    void window.loadFile(path.join(currentDirectory, "renderer", "index.html"));
+  } else {
+    void window.loadURL("http://127.0.0.1:5173");
+  }
+  return window;
+}
+
+// 初始化共享 RPC 服务后创建第一个窗口；后续窗口复用该服务，各自拥有客户端状态。
+async function initializeApplication(): Promise<void> {
   // 工作区注册表保存在 Electron 用户数据目录。
   workspaceStore = new WorkspaceStore(
     path.join(app.getPath("userData"), "workspaces"),
@@ -325,26 +354,22 @@ async function createMainWindow(): Promise<void> {
   });
   rpcBootstrap = await rpcServer.listen();
 
-  const window = new BrowserWindow({
-    width: 1100,
-    height: 760,
-    webPreferences: {
-      preload: path.join(currentDirectory, "preload.cjs"),
-      contextIsolation: true,
-      nodeIntegration: false,
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    {
+      label: "文件",
+      submenu: [
+        { label: "新建窗口", accelerator: "CmdOrCtrl+Shift+N", click: () => createWindow() },
+        { type: "separator" },
+        { role: "quit", label: "退出" },
+      ],
     },
-  });
+  ]));
 
-  // 开发时加载 Vite 开发服务器；打包后加载本地构建出的页面。
-  if (app.isPackaged) {
-    void window.loadFile(path.join(currentDirectory, "renderer", "index.html"));
-  } else {
-    void window.loadURL("http://127.0.0.1:5173");
-  }
+  createWindow();
 }
 
 // Electron 初始化完成后创建窗口，并记录初始化失败的具体原因。
-void app.whenReady().then(createMainWindow).catch((error: unknown) => {
+void app.whenReady().then(initializeApplication).catch((error: unknown) => {
   console.error("Failed to initialize the application:", error);
   app.quit();
 });
@@ -352,6 +377,11 @@ void app.whenReady().then(createMainWindow).catch((error: unknown) => {
 // macOS 通常在关闭最后一个窗口后保留应用；其他平台则退出应用。
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+// macOS 在窗口全部关闭后仍保留应用；用户从 Dock 激活时重新创建一个窗口。
+app.on("activate", () => {
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
 // 先等待 Agent 子进程关闭，再让 Electron 正常退出。
