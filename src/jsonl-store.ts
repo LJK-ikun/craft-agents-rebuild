@@ -15,6 +15,9 @@ export type ConversationMessage = {
   content: string;
 };
 
+// 与原版 Craft 默认工作流对应的会话状态。
+export type SessionStatus = "todo" | "in_progress" | "needs_review" | "done" | "cancelled";
+
 // 描述会话列表里的一项。
 // 会话列表只存基本信息，具体聊天消息单独存在 JSONL 文件中。
 export type SessionRecord = {
@@ -24,6 +27,8 @@ export type SessionRecord = {
   updatedAt: string; // 最近一次保存消息的时间。
   sdkSessionId?: string; // Claude SDK 的会话 ID，用来在下次提问时恢复上下文。
   permissionMode?: "explore" | "ask" | "execute"; // 该会话的工具执行权限模式。
+  status?: SessionStatus; // Inbox 工作流状态；旧记录缺省时按 todo 显示。
+  isFlagged?: boolean; // 是否被标记为重点会话。
 };
 
 // 负责管理所有会话的本地文件。
@@ -83,6 +88,8 @@ export class JsonlSessionStore {
       title: "默认会话",
       createdAt: now,
       updatedAt: now,
+      status: "todo",
+      isFlagged: false,
     };
 
     // 把默认会话写入会话列表文件。
@@ -106,6 +113,8 @@ export class JsonlSessionStore {
       title: "新会话",
       createdAt: now,
       updatedAt: now,
+      status: "todo",
+      isFlagged: false,
     };
 
     // 把新会话放在列表开头，界面可以优先显示它。
@@ -144,6 +153,31 @@ export class JsonlSessionStore {
 
     sessions[sessionIndex] = { ...sessions[sessionIndex], permissionMode };
     await this.saveSessions(sessions);
+  }
+
+  // 更新会话在 Inbox 中的工作流状态，不修改聊天消息 JSONL。
+  async saveStatus(sessionId: string, status: SessionStatus): Promise<SessionRecord> {
+    return this.updateSession(sessionId, { status });
+  }
+
+  // 更新会话是否被标记，供列表快速识别重要任务。
+  async saveFlag(sessionId: string, isFlagged: boolean): Promise<SessionRecord> {
+    return this.updateSession(sessionId, { isFlagged });
+  }
+
+  // 会话标题、状态、Flag 等元数据统一保存在 index.json。
+  private async updateSession(
+    sessionId: string,
+    changes: Partial<Pick<SessionRecord, "status" | "isFlagged">>,
+  ): Promise<SessionRecord> {
+    const sessions = await this.listSessions();
+    const sessionIndex = sessions.findIndex((session) => session.id === sessionId);
+    if (sessionIndex === -1) throw new Error("找不到要更新的会话。");
+
+    const updatedSession = { ...sessions[sessionIndex], ...changes };
+    sessions[sessionIndex] = updatedSession;
+    await this.saveSessions(sessions);
+    return updatedSession;
   }
 
   // 读取指定会话中的全部消息。

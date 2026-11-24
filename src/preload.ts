@@ -49,6 +49,14 @@ contextBridge.exposeInMainWorld("craftAgent", {
   // 会话和工作区操作统一通过 WebSocket-RPC 到达主进程。
   listSessions: () => rpcClient.invoke("session:list"),
 
+  // 修改会话的 Inbox 工作流状态。
+  setSessionStatus: (sessionId: string, status: "todo" | "in_progress" | "needs_review" | "done" | "cancelled") =>
+    rpcClient.invoke("session:set-status", sessionId, status),
+
+  // 修改会话的 Flag 标记。
+  setSessionFlag: (sessionId: string, isFlagged: boolean) =>
+    rpcClient.invoke("session:set-flag", sessionId, isFlagged),
+
   // 创建新会话，并返回新会话信息和空消息列表。
   createSession: () => rpcClient.invoke("session:create"),
 

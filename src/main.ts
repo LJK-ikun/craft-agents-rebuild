@@ -7,6 +7,7 @@ import {
   JsonlSessionStore,
   type ConversationMessage,
   type SessionRecord,
+  type SessionStatus,
 } from "./jsonl-store.ts";
 
 import { WorkspaceStore } from "./workspace-store.ts";
@@ -218,6 +219,28 @@ function registerRpcHandlers(server: CraftRpcServer): void {
     const store = getClientRuntime(context.clientId).sessionStore;
     if (!store) throw new Error("请先选择工作区。");
     return store.listSessions();
+  });
+
+  // 更新 Inbox 工作流状态；只接受原版默认状态集合中的值。
+  server.handle("session:set-status", async (context, sessionId: unknown, status: unknown) => {
+    const store = getClientRuntime(context.clientId).sessionStore;
+    if (!store) throw new Error("请先选择工作区。");
+    if (typeof sessionId !== "string") throw new Error("会话 ID 无效。");
+    const allowedStatuses: SessionStatus[] = ["todo", "in_progress", "needs_review", "done", "cancelled"];
+    if (typeof status !== "string" || !allowedStatuses.includes(status as SessionStatus)) {
+      throw new Error("会话状态无效。");
+    }
+    return store.saveStatus(sessionId, status as SessionStatus);
+  });
+
+  // 更新会话 Flag 标记；主进程检查类型后才修改持久化记录。
+  server.handle("session:set-flag", async (context, sessionId: unknown, isFlagged: unknown) => {
+    const store = getClientRuntime(context.clientId).sessionStore;
+    if (!store) throw new Error("请先选择工作区。");
+    if (typeof sessionId !== "string" || typeof isFlagged !== "boolean") {
+      throw new Error("会话标记参数无效。");
+    }
+    return store.saveFlag(sessionId, isFlagged);
   });
 
   // 创建会话时只替换当前客户端的 Agent，不影响其他窗口正在使用的 Agent。

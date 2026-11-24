@@ -15,6 +15,17 @@ type Session = {
   createdAt: string;
   updatedAt: string;
   permissionMode?: "explore" | "ask" | "execute";
+  status?: "todo" | "in_progress" | "needs_review" | "done" | "cancelled";
+  isFlagged?: boolean;
+};
+
+// 把原版默认状态值转换为会话列表中显示的中文。
+const sessionStatusLabels: Record<NonNullable<Session["status"]>, string> = {
+  todo: "待办",
+  in_progress: "进行中",
+  needs_review: "待检查",
+  done: "已完成",
+  cancelled: "已取消",
 };
 
 // Workspace 列表显示的基本信息。
@@ -385,6 +396,26 @@ export function App() {
     }
   }
 
+  // 保存状态后用主进程返回的记录更新本地列表。
+  async function handleSessionStatusChange(sessionId: string, status: NonNullable<Session["status"]>) {
+    try {
+      const updated = await window.craftAgent.setSessionStatus(sessionId, status);
+      setSessions((current) => current.map((session) => session.id === updated.id ? updated : session));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  // 切换 Flag，标出需要在 Inbox 中重点关注的会话。
+  async function handleSessionFlagToggle(session: Session) {
+    try {
+      const updated = await window.craftAgent.setSessionFlag(session.id, !session.isFlagged);
+      setSessions((current) => current.map((item) => item.id === updated.id ? updated : item));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   return (
     <main style={{ display: "flex", gap: 24, margin: "32px auto", maxWidth: 1100, padding: 24 }}>
       <aside style={{ minWidth: 220 }}>
@@ -418,16 +449,35 @@ export function App() {
         </button>
 
         {sessions.map((session) => (
-          <button
-            aria-pressed={session.id === activeSessionId}
-            disabled={busy || loading}
-            key={session.id}
-            onClick={() => void handleSelectSession(session.id)}
-            style={{ display: "block", marginTop: 8 }}
-            type="button"
-          >
-            {session.title}
-          </button>
+          <div key={session.id} style={{ alignItems: "center", display: "flex", gap: 4, marginTop: 8 }}>
+            <button
+              aria-pressed={session.id === activeSessionId}
+              disabled={busy || loading}
+              onClick={() => void handleSelectSession(session.id)}
+              type="button"
+            >
+              {session.isFlagged ? "★ " : ""}{session.title} · {sessionStatusLabels[session.status ?? "todo"]}
+            </button>
+            <select
+              aria-label={`设置 ${session.title} 的状态`}
+              disabled={busy || loading}
+              onChange={(event) => void handleSessionStatusChange(session.id, event.target.value as NonNullable<Session["status"]>)}
+              value={session.status ?? "todo"}
+            >
+              {Object.entries(sessionStatusLabels).map(([value, label]) => (
+                <option key={value} value={value}>{label}</option>
+              ))}
+            </select>
+            <button
+              aria-label={session.isFlagged ? `取消标记 ${session.title}` : `标记 ${session.title}`}
+              aria-pressed={session.isFlagged ?? false}
+              disabled={busy || loading}
+              onClick={() => void handleSessionFlagToggle(session)}
+              type="button"
+            >
+              {session.isFlagged ? "★" : "☆"}
+            </button>
+          </div>
         ))}
 
         <h2>Sources</h2>

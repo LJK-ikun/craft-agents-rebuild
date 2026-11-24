@@ -18,6 +18,8 @@ type CraftSession = {
   createdAt: string;
   updatedAt: string;
   permissionMode?: "explore" | "ask" | "execute";
+  status?: "todo" | "in_progress" | "needs_review" | "done" | "cancelled";
+  isFlagged?: boolean;
 }
 
 // 描述一个工作区：rootPath 存 Craft 管理的数据，workingDirectory 是项目目录。
@@ -81,6 +83,12 @@ declare global {
 
       // 获取会话列表，用来显示可切换的会话
       listSessions(): Promise<CraftSession[]>;
+
+      // 修改一个会话的工作流状态，并返回保存后的会话记录。
+      setSessionStatus(sessionId: string, status: NonNullable<CraftSession["status"]>): Promise<CraftSession>;
+
+      // 修改会话的 Flag 标记，并返回保存后的会话记录。
+      setSessionFlag(sessionId: string, isFlagged: boolean): Promise<CraftSession>;
 
       // 创建会话，并返回新会话信息和初始消息列表
       createSession(): Promise<{
