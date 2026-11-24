@@ -8,10 +8,14 @@ type PendingRequest = {
   timeout: ReturnType<typeof setTimeout>;
 };
 
+// 一个事件频道可以有多个界面订阅者。
+type RpcEventListener = (...args: unknown[]) => void;
+
 /** Preload 使用的客户端；Renderer 只拿到受控 API，不会接触 WebSocket。 */
 export class CraftRpcClient {
   private readonly socket: WebSocket;
   private readonly pending = new Map<string, PendingRequest>();
+  private readonly listeners = new Map<string, Set<RpcEventListener>>();
   private readonly connected: Promise<void>;
   private resolveConnected!: () => void;
   private rejectConnected!: (error: Error) => void;
@@ -46,10 +50,12 @@ export class CraftRpcClient {
 
     const id = randomUUID();
     return await new Promise<T>((resolve, reject) => {
+      // Agent 一轮可能运行较久；普通读取/切换请求仍使用较短超时。
+      const timeoutMs = channel === "agent:ask" ? 10 * 60_000 : 30_000;
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`RPC 请求超时：${channel}`));
-      }, 30_000);
+      }, timeoutMs);
 
       this.pending.set(id, {
         resolve: (result) => resolve(result as T),
@@ -72,6 +78,21 @@ export class CraftRpcClient {
     });
   }
 
+  /** 订阅后端主动推送的事件，并返回取消订阅函数。 */
+  on(channel: string, listener: RpcEventListener): () => void {
+    let channelListeners = this.listeners.get(channel);
+    if (!channelListeners) {
+      channelListeners = new Set();
+      this.listeners.set(channel, channelListeners);
+    }
+    channelListeners.add(listener);
+
+    return () => {
+      channelListeners?.delete(listener);
+      if (channelListeners?.size === 0) this.listeners.delete(channel);
+    };
+  }
+
   /** 按响应 id 找到原请求，并完成对应 Promise。 */
   private handleMessage(raw: string): void {
     let message: RpcMessage;
@@ -84,6 +105,13 @@ export class CraftRpcClient {
 
     if (message.type === "handshake_ack") {
       this.resolveConnected();
+      return;
+    }
+
+    if (message.type === "event") {
+      for (const listener of this.listeners.get(message.channel) ?? []) {
+        listener(...message.args);
+      }
       return;
     }
 

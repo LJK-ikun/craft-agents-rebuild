@@ -50,14 +50,14 @@ let agent: Agent | null = null;
 let sessionStore: JsonlSessionStore | null = null;
 let activeSessionId: string | null = null;
 // 一个窗口一次只运行一个请求；取消操作必须发回启动该请求的 Agent。
-let activeAsk: { id: string; agent: Agent } | null = null;
-// 权限确认可能晚于会话切换；用 requestId 记录原 Agent，避免把决定发错进程。
-const permissionOwners = new Map<string, Agent>();
+let activeAsk: { id: string; agent: Agent; clientId: string } | null = null;
+// 每个确认请求记录发起它的 Agent 和窗口，避免其他客户端代为批准。
+const permissionOwners = new Map<string, { agent: Agent; clientId: string }>();
 
 function clearPermissionsForAgent(target: Agent | null): void {
   if (!target) return;
   for (const [requestId, owner] of permissionOwners) {
-    if (owner === target) permissionOwners.delete(requestId);
+    if (owner.agent === target) permissionOwners.delete(requestId);
   }
 }
 
@@ -141,8 +141,14 @@ async function activateWorkspace(workspaceId: string) {
   };
 }
 
-// 界面请求新建会话时，主进程创建记录并切换到这个空会话。
-ipcMain.handle("session:create", async () => {
+// 把应用业务能力注册到 WebSocket-RPC；Renderer 只能调用这里明确开放的频道。
+function registerRpcHandlers(server: CraftRpcServer): void {
+  server.handle("session:list", async () => {
+    if (!sessionStore) throw new Error("会话存储尚未初始化。");
+    return sessionStore.listSessions();
+  });
+
+  server.handle("session:create", async () => {
   if (!sessionStore) throw new Error("会话存储尚未初始化。");
   if (!activeWorkingDirectory) throw new Error("当前工作区尚未初始化。");
 
@@ -161,10 +167,10 @@ ipcMain.handle("session:create", async () => {
 
   // 把新会话资料和空消息列表交还给界面。
   return { session, messages: [] };
-});
+  });
 
 // 界面选择会话时，主进程读取该会话历史并重建 Agent
-ipcMain.handle("session:select", async (_event, sessionId: unknown) => {
+  server.handle("session:select", async (_context, sessionId: unknown) => {
   if (!sessionStore) throw new Error("会话存储尚未初始化")
   if (typeof sessionId !== "string") {
     throw new Error("会话 ID 无效")
@@ -191,14 +197,14 @@ ipcMain.handle("session:select", async (_event, sessionId: unknown) => {
   )
 
   return { messages, toolActivities }
-})
+  });
 // 返回所有已登记的工作区，供界面显示工作区列表。
-ipcMain.handle("workspace:list", async () => {
+  server.handle("workspace:list", async () => {
   return workspaceStore.list();
-});
+  });
 
 // 弹出目录选择框，把用户选中的项目文件夹登记成工作区。
-ipcMain.handle("workspace:add", async () => {
+  server.handle("workspace:add", async () => {
   const result = await dialog.showOpenDialog({
     title: "选择项目文件夹",
     properties: ["openDirectory"],
@@ -212,38 +218,39 @@ ipcMain.handle("workspace:add", async () => {
   // 保存工作区后立即切换过去。
   const workspace = await workspaceStore.addWorkspace(result.filePaths[0]);
   return activateWorkspace(workspace.id);
-});
+  });
 
 // 切换到界面指定的工作区。
-ipcMain.handle("workspace:select", async (_event, workspaceId: unknown) => {
+  server.handle("workspace:select", async (_context, workspaceId: unknown) => {
   if (typeof workspaceId !== "string") {
     throw new Error("工作区 ID 无效。");
   }
 
   return activateWorkspace(workspaceId);
-});
+  });
 // 界面读取当前会话历史时，只返回当前 ID 对应的消息
-ipcMain.handle("session:history", async () => {
+  server.handle("session:history", async () => {
   if (!sessionStore) throw new Error("会话存储尚未初始化。");
   if (!activeSessionId) throw new Error("当前没有选中的会话。");
 
   return sessionStore.loadMessages(activeSessionId);
-});
+  });
 
 // 只有当前确实发出过该权限请求的 Agent，才能收到界面的批准结果。
-ipcMain.handle("agent:permission-response", (_event, requestId: unknown, approved: unknown) => {
+  server.handle("agent:permission-response", (context, requestId: unknown, approved: unknown) => {
   if (typeof requestId !== "string" || typeof approved !== "boolean") {
     throw new Error("工具权限响应无效。");
   }
   const owner = permissionOwners.get(requestId);
   if (!owner) throw new Error("该工具请求已失效或已经处理。");
+  if (owner.clientId !== context.clientId) throw new Error("无权响应其他窗口的工具请求。");
 
   permissionOwners.delete(requestId);
-  owner.respondToPermission?.(requestId, approved);
+  owner.agent.respondToPermission(requestId, approved);
 });
 
 // 保存当前会话的权限模式，并立即同步给当前运行中的 Pi Agent。
-ipcMain.handle("session:set-permission-mode", async (_event, mode: unknown) => {
+  server.handle("session:set-permission-mode", async (_context, mode: unknown) => {
   if (mode !== "explore" && mode !== "ask" && mode !== "execute") {
     throw new Error("权限模式无效。");
   }
@@ -252,19 +259,19 @@ ipcMain.handle("session:set-permission-mode", async (_event, mode: unknown) => {
   await sessionStore.savePermissionMode(activeSessionId, mode);
   agent?.setPermissionMode(mode);
   return mode;
-});
+  });
 
 // 界面停止按钮只请求中止当前运行，不会关闭会话或清除已有历史。
-ipcMain.handle("agent:cancel", async () => {
-  const runningAsk = activeAsk;
+  server.handle("agent:cancel", async (context) => {
+  const runningAsk = activeAsk?.clientId === context.clientId ? activeAsk : null;
   if (!runningAsk) return false;
 
   await runningAsk.agent.cancel();
   return true;
-});
+  });
 
 // 界面发送问题时，调用当前会话的 Agent，并把问答保存到当前会话。
-ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> => {
+  server.handle("agent:ask", async (context, userText: unknown): Promise<string> => {
   if (typeof userText !== "string" || !userText.trim()) {
     throw new Error("请输入有效的问题。");
   }
@@ -283,7 +290,7 @@ ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> =>
   const sessionId = activeSessionId;
   const question = userText.trim();
   const askId = randomUUID();
-  activeAsk = { id: askId, agent: currentAgent };
+  activeAsk = { id: askId, agent: currentAgent, clientId: context.clientId };
 
   const answerParts: string[] = [];
 
@@ -291,12 +298,12 @@ ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> =>
   try {
     for await (const agentEvent of currentAgent.chat(question)) {
       if (agentEvent.type === "permission_request") {
-        permissionOwners.set(agentEvent.requestId, currentAgent);
+        permissionOwners.set(agentEvent.requestId, { agent: currentAgent, clientId: context.clientId });
       }
       if (agentEvent.type === "cancelled") {
         clearPermissionsForAgent(currentAgent);
       }
-      event.sender.send("agent:event", agentEvent);
+      server.pushToClient(context.clientId, "agent:event", agentEvent);
 
       // 持久化工具轨迹；若日志写入失败，记录错误但不中断模型本轮执行。
       if (agentEvent.type === "tool_start" || agentEvent.type === "tool_result") {
@@ -332,7 +339,8 @@ ipcMain.handle("agent:ask", async (event, userText: unknown): Promise<string> =>
   });
 
   return answer;
-});
+  });
+}
 
 // 创建窗口前先恢复默认会话及历史
 async function createMainWindow(): Promise<void> {
@@ -347,12 +355,9 @@ async function createMainWindow(): Promise<void> {
     await activateWorkspace(workspaces[0].id);
   }
 
-  // 建立第一条 WebSocket-RPC 业务频道：Renderer 可通过它读取会话列表。
+  // 建立 WebSocket-RPC 服务，并注册所有工作区、会话和 Agent 业务频道。
   rpcServer = new CraftRpcServer();
-  rpcServer.handle("session:list", async () => {
-    if (!sessionStore) throw new Error("会话存储尚未初始化。");
-    return sessionStore.listSessions();
-  });
+  registerRpcHandlers(rpcServer);
   rpcBootstrap = await rpcServer.listen();
 
   const window = new BrowserWindow({

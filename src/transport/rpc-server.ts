@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { RpcBootstrap, RpcMessage } from "./rpc-types.ts";
+import type { RpcBootstrap, RpcMessage, RpcRequestContext } from "./rpc-types.ts";
 
 // 一个频道对应一个后端业务处理函数。
-type RpcHandler = (...args: unknown[]) => unknown | Promise<unknown>;
+type RpcHandler = (context: RpcRequestContext, ...args: unknown[]) => unknown | Promise<unknown>;
 
 /** 在 Electron 主进程中提供本地 WebSocket-RPC 服务。 */
 export class CraftRpcServer {
@@ -15,6 +15,8 @@ export class CraftRpcServer {
   private readonly token = randomUUID();
   // channel 是稳定的业务方法名，不直接把任意函数名暴露给网页。
   private readonly handlers = new Map<string, RpcHandler>();
+  // 只保留已完成令牌握手的客户端，供服务端向指定界面推送事件。
+  private readonly clients = new Map<string, WebSocket>();
 
   constructor() {
     this.listening = new Promise<void>((resolve, reject) => {
@@ -52,8 +54,16 @@ export class CraftRpcServer {
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
 
+  /** 向指定客户端推送事件；例如把 Agent 的文字增量送回发起请求的窗口。 */
+  pushToClient(clientId: string, channel: string, ...args: unknown[]): void {
+    const socket = this.clients.get(clientId);
+    if (!socket) return;
+    this.send(socket, { type: "event", id: randomUUID(), channel, args });
+  }
+
   /** 处理一个新连接：先验令牌，再允许它发送 RPC 请求。 */
   private accept(socket: WebSocket): void {
+    const clientId = randomUUID();
     let authenticated = false;
 
     const handshakeTimer = setTimeout(() => {
@@ -61,10 +71,14 @@ export class CraftRpcServer {
     }, 5_000);
     handshakeTimer.unref();
 
-    socket.on("close", () => clearTimeout(handshakeTimer));
+    socket.on("close", () => {
+      clearTimeout(handshakeTimer);
+      this.clients.delete(clientId);
+    });
     socket.on("message", (raw) => {
-      void this.handleMessage(socket, raw.toString(), () => authenticated, () => {
+      void this.handleMessage(socket, clientId, raw.toString(), () => authenticated, () => {
         authenticated = true;
+        this.clients.set(clientId, socket);
         clearTimeout(handshakeTimer);
       });
     });
@@ -73,6 +87,7 @@ export class CraftRpcServer {
   /** 验证消息类型、执行频道处理函数，并把结果回给原请求。 */
   private async handleMessage(
     socket: WebSocket,
+    clientId: string,
     raw: string,
     isAuthenticated: () => boolean,
     onAuthenticated: () => void,
@@ -119,7 +134,7 @@ export class CraftRpcServer {
     }
 
     try {
-      const result = await handler(...message.args);
+      const result = await handler({ clientId }, ...message.args);
       this.send(socket, { type: "response", id: message.id, result });
     } catch (error) {
       this.send(socket, {

@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
+import { contextBridge, ipcRenderer } from "electron";
 import type { AgentEvent } from "./types.ts";
 import { CraftRpcClient } from "./transport/rpc-client.ts";
 import type { RpcBootstrap } from "./transport/rpc-types.ts";
@@ -8,55 +8,49 @@ const rpcBootstrap = ipcRenderer.sendSync("rpc:bootstrap") as RpcBootstrap | nul
 if (!rpcBootstrap) throw new Error("主进程尚未启动 RPC 服务。");
 const rpcClient = new CraftRpcClient(rpcBootstrap);
 
-// 目前先暴露一个只读的应用信息示例；后续再逐个增加安全 IPC 能力。
+// 只把业务方法暴露给网页；Renderer 本身拿不到 ipcRenderer 或 WebSocket。
 contextBridge.exposeInMainWorld("craftAgent", {
-  // 界面调用 ask 时， Preload 把问题送到主进程 agent:ask 通道，
-  // invoke 会等主进程处理完，再把回答作为 Promise 返回给界面。
-  ask: (userText: string): Promise<string> => ipcRenderer.invoke("agent:ask", userText),
+  // 每个 invoke 都是一个带频道名和参数的 RPC 请求。
+  ask: (userText: string): Promise<string> => rpcClient.invoke("agent:ask", userText),
 
   // 停止当前正在运行的 Agent 请求。
-  cancel: (): Promise<boolean> => ipcRenderer.invoke("agent:cancel"),
+  cancel: (): Promise<boolean> => rpcClient.invoke("agent:cancel"),
 
   // 把工具确认结果送回主进程；网页不能直接访问 Pi 子进程或系统工具。
   respondToPermission: (requestId: string, approved: boolean): Promise<void> =>
-    ipcRenderer.invoke("agent:permission-response", requestId, approved),
+    rpcClient.invoke("agent:permission-response", requestId, approved),
 
   // 修改当前会话的权限模式；主进程会先保存，再通知 Agent 后端。
   setPermissionMode: (mode: "explore" | "ask" | "execute"): Promise<string> =>
-    ipcRenderer.invoke("session:set-permission-mode", mode),
+    rpcClient.invoke("session:set-permission-mode", mode),
 
   // 只暴露 Agent 事件订阅方法，不把整个 ipcRenderer 交给网页。
   onAgentEvent: (callback: (event: AgentEvent) => void): (() => void) => {
-    const listener = (_ipcEvent: IpcRendererEvent, event: AgentEvent) => {
-      callback(event);
-    };
-
-    ipcRenderer.on("agent:event", listener);
-    return () => ipcRenderer.removeListener("agent:event", listener);
+    return rpcClient.on("agent:event", (...args) => callback(args[0] as AgentEvent));
   },
 
-  // 界面调用 getHistory 时，通过 IPC 向主进程请求历史消息。
+  // 通过 RPC 读取当前会话的历史消息。
   getHistory: (): Promise<
   Array<{ role: "user" | "assistant"; content: string }>
-  > => ipcRenderer.invoke("session:history"),
+  > => rpcClient.invoke("session:history"),
 
-  // 会话列表通过 WebSocket-RPC 请求后端；其他尚未迁移的功能仍使用 IPC。
+  // 会话和工作区操作统一通过 WebSocket-RPC 到达主进程。
   listSessions: () => rpcClient.invoke("session:list"),
 
   // 创建新会话，并返回新会话信息和空消息列表。
-  createSession: () => ipcRenderer.invoke("session:create"),
+  createSession: () => rpcClient.invoke("session:create"),
 
   // 切换到指定会话，主进程会返回该会话的历史消息。
   selectSession: (sessionId: string) =>
-    ipcRenderer.invoke("session:select", sessionId),
+    rpcClient.invoke("session:select", sessionId),
 
   // 获取所有已添加的工作区。
-  listWorkspaces: () => ipcRenderer.invoke("workspace:list"),
+  listWorkspaces: () => rpcClient.invoke("workspace:list"),
 
   // 弹出目录选择框并添加工作区；用户取消时主进程返回 null。
-  addWorkspace: () => ipcRenderer.invoke("workspace:add"),
+  addWorkspace: () => rpcClient.invoke("workspace:add"),
 
   // 切换工作区，并取得该工作区当前会话和聊天记录。
   selectWorkspace: (workspaceId: string) =>
-    ipcRenderer.invoke("workspace:select", workspaceId),
+    rpcClient.invoke("workspace:select", workspaceId),
 })

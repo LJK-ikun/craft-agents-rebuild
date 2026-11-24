@@ -3,8 +3,14 @@ export type RpcMessage =
   | { type: "handshake"; id: string; token: string; protocolVersion: 1 }
   | { type: "handshake_ack"; id: string; protocolVersion: 1 }
   | { type: "request"; id: string; channel: string; args: unknown[] }
+  | { type: "event"; id: string; channel: string; args: unknown[] }
   | { type: "response"; id: string; result: unknown }
   | { type: "error"; id: string; error: { message: string } };
+
+// 让后端 handler 知道请求来自哪个已握手的桌面客户端。
+export type RpcRequestContext = {
+  clientId: string;
+};
 
 // Preload 先通过 Electron IPC 得到连接地址和一次性应用令牌。
 export type RpcBootstrap = {
